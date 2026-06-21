@@ -25,6 +25,8 @@ SITES_ENABLED="/etc/nginx/sites-enabled"
 GLOBAL_CONF="/etc/nginx/conf.d/00-nginx-rp.conf"
 DENY_IP_CONF="/etc/nginx/conf.d/00-deny-direct-ip.conf"   # 禁止用 IP 直连的兜底 server
 CERT_DIR="/etc/nginx/certs"
+BACKUP_DIR="/etc/nginx/nginx-rp-backups"   # 导入/删除外部配置前的备份目录
+NGINX_CONF_D="/etc/nginx/conf.d"           # 发现/管理外部反代时用（可被测试覆盖）
 ACME_WEBROOT="/var/www/acme"
 CACHE_DIR="/var/cache/nginx/nginx_rp"
 ACME_HOME="$HOME/.acme.sh"
@@ -375,6 +377,26 @@ EOF
     ok "公共配置已写入 $GLOBAL_CONF"
 }
 
+# 确保 nginx.conf 引入 sites-enabled（部分精简/第三方安装默认只用 conf.d）。
+# 安装、以及把外部反代导入为受管站点（落在 sites-available + sites-enabled 软链）时都要先确保它，
+# 否则受管站点不会被加载、而 nginx -t 仍通过 → reload「假成功」但站点其实没生效。
+ensure_sites_enabled_include() {
+    grep -qE "include\s+/etc/nginx/sites-enabled/\*" /etc/nginx/nginx.conf 2>/dev/null && return 0
+    if grep -qE "include\s+/etc/nginx/conf\.d/\*\.conf;" /etc/nginx/nginx.conf 2>/dev/null; then
+        sed -i '/include \/etc\/nginx\/conf.d\/\*.conf;/a \    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
+        warn "已向 nginx.conf 补充 sites-enabled 引入"
+        return 0
+    fi
+    # 兜底：插到第一个 http { 之后
+    if grep -qE '^[[:space:]]*http[[:space:]]*\{' /etc/nginx/nginx.conf 2>/dev/null; then
+        sed -i '0,/http[[:space:]]*{/s//&\n    include \/etc\/nginx\/sites-enabled\/*;/' /etc/nginx/nginx.conf
+        warn "已向 nginx.conf 的 http 块补充 sites-enabled 引入"
+        return 0
+    fi
+    warn "无法自动确认 nginx.conf 是否引入 sites-enabled，请手动确认。"
+    return 1
+}
+
 # ----------------------------- 安装 Nginx -----------------------------------
 install_nginx() {
     if command -v nginx >/dev/null 2>&1; then
@@ -386,11 +408,7 @@ install_nginx() {
     fi
 
     mkdir -p "$SITES_AVAIL" "$SITES_ENABLED"
-    # 确保 nginx.conf 引入 sites-enabled（部分精简安装没有）
-    if ! grep -qE "include\s+/etc/nginx/sites-enabled/\*" /etc/nginx/nginx.conf; then
-        sed -i '/include \/etc\/nginx\/conf.d\/\*.conf;/a \    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
-        warn "已向 nginx.conf 补充 sites-enabled 引入"
-    fi
+    ensure_sites_enabled_include
 
     ensure_global_conf
     open_firewall
@@ -809,31 +827,106 @@ configure_reverse_proxy() {
     pause
 }
 
+# ----------------------------- 发现本机所有反代 -----------------------------
+# 候选配置文件（去重为真实路径）：标准目录 + nginx -T 已加载文件（兜底自定义 include 位置）。
+_candidate_conf_files() {
+    {
+        local f p
+        for f in "$SITES_AVAIL"/* "$SITES_ENABLED"/* \
+                 "$NGINX_CONF_D"/*.conf "$NGINX_CONF_D"/*.conf.disabled; do
+            [ -e "$f" ] && readlink -f "$f"
+        done
+        # nginx -T 列出的已加载文件（含自定义位置）；nginx 不可用时这段为空
+        nginx -T 2>/dev/null | sed -n 's/^# configuration file \(.*\):$/\1/p' | \
+            while read -r p; do [ -e "$p" ] && readlink -f "$p"; done
+    } 2>/dev/null | sort -u
+}
+
+_nocomment() { grep -vE '^[[:space:]]*#' "$1" 2>/dev/null; }   # 去掉整行注释
+
+# 第一个有意义的 server_name（排除 _ / localhost / 空）
+_first_server_name() {
+    _nocomment "$1" | grep -oE 'server_name[[:space:]]+[^;]+' | sed -E 's/server_name[[:space:]]+//' \
+        | tr '[:blank:]' '\n' | grep -vE '^(_|localhost|)$' | head -1
+}
+_first_proxy_pass() {   # 第一个 proxy_pass 目标
+    _nocomment "$1" | grep -oE 'proxy_pass[[:space:]]+[^;]+' | sed -E 's/proxy_pass[[:space:]]+//' | head -1
+}
+_distinct_domains() {   # 文件里不同域名个数（导入守卫用）
+    _nocomment "$1" | grep -oE 'server_name[[:space:]]+[^;]+' | sed -E 's/server_name[[:space:]]+//' \
+        | tr '[:blank:]' '\n' | grep -vE '^(_|localhost|)$' | sort -u | grep -c .
+}
+# 启用状态：enabled / disabled / loaded（非标准位置，只读）
+_site_enabled() {
+    local real; real=$(readlink -f "$1" 2>/dev/null || echo "$1")
+    case "$real" in
+        "$SITES_AVAIL"/*)
+            local e
+            for e in "$SITES_ENABLED"/*; do
+                [ -e "$e" ] || continue
+                [ "$(readlink -f "$e" 2>/dev/null)" = "$real" ] && { echo enabled; return; }
+            done
+            echo disabled ;;
+        "$NGINX_CONF_D"/*.conf.disabled) echo disabled ;;
+        "$NGINX_CONF_D"/*.conf)          echo enabled ;;
+        *) echo loaded ;;
+    esac
+}
+
+# 输出每行：file|kind(managed/external)|domain|target|enabled
+discover_proxies() {
+    local f kind domain target enabled
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        case "$f" in *~|*.bak|*.save|*.orig|*.dpkg-*|*.ucf-*|*.rpmsave|*.rpmnew) continue ;; esac  # 跳过备份/编辑器残file
+        _nocomment "$f" | grep -q 'proxy_pass' || continue   # 必须是反代
+        _nocomment "$f" | grep -q 'server'     || continue   # 且含 server 块
+        if grep -qE "(nginx-rp|1keji-rp) BEGIN" "$f"; then kind=managed; else kind=external; fi
+        domain=$(_first_server_name "$f"); [ -z "$domain" ] && domain="(无 server_name)"
+        target=$(_first_proxy_pass "$f");  [ -z "$target" ] && target="?"
+        enabled=$(_site_enabled "$f")
+        printf '%s|%s|%s|%s|%s\n' "$f" "$kind" "$domain" "$target" "$enabled"
+    done < <(_candidate_conf_files)
+}
+
 # ----------------------------- 列出/管理站点 -------------------------------
-list_sites() {
-    local found=0 i=1
-    SITE_FILES=()
-    for f in "$SITES_AVAIL"/*.conf; do
-        [ -e "$f" ] || continue
-        grep -qE "(nginx-rp|1keji-rp) BEGIN" "$f" || continue   # 1keji-rp：兼容旧版站点，重渲染后自动迁移到新标记
-        local d t c s
-        d=$(get_meta domain "$f"); t=$(get_meta target "$f")
-        c=$(get_meta cache "$f");  s=$(get_meta ssl "$f")
-        printf "  %d) %-28s -> %-28s [缓存:%s 证书:%s]\n" "$i" "$d" "$t" "$c" "$s"
-        SITE_FILES+=("$f"); i=$((i+1)); found=1
-    done
-    [ "$found" -eq 0 ] && { warn "没有由本脚本管理的反代站点"; return 1; }
+# 统一列表：填充并列编号数组，打印清单。返回 1 表示一个都没发现。
+list_all_proxies() {
+    SITE_FILES=(); SITE_KIND=(); SITE_DOMAIN=(); SITE_TARGET=(); SITE_ENABLED=()
+    local f kind domain target enabled i=1 ktag etag
+    while IFS='|' read -r f kind domain target enabled; do
+        [ -z "$f" ] && continue
+        SITE_FILES+=("$f"); SITE_KIND+=("$kind"); SITE_DOMAIN+=("$domain")
+        SITE_TARGET+=("$target"); SITE_ENABLED+=("$enabled")
+        case "$kind"    in managed) ktag="本脚本";; *) ktag="外部";; esac
+        case "$enabled" in enabled) etag="启用";; disabled) etag="停用";; *) etag="已加载";; esac
+        printf "  %d) %-26s -> %-28s [%s · %s]\n" "$i" "$domain" "$target" "$ktag" "$etag"
+        i=$((i+1))
+    done < <(discover_proxies)
+    [ "${#SITE_FILES[@]}" -eq 0 ] && { warn "未发现任何反向代理配置"; return 1; }
     return 0
 }
 
 manage_reverse_proxy() {
-    echo "已配置的反代站点："
-    list_sites || { pause; return; }
+    echo "本机反向代理站点（本脚本托管 + 外部配置）："
+    list_all_proxies || { pause; return; }
     local idx; read -rp "选择要管理的站点序号（回车返回）: " idx
     [ -z "$idx" ] && return
-    local f="${SITE_FILES[$((idx-1))]}"
-    [ -z "$f" ] || [ ! -f "$f" ] && { err "无效序号"; pause; return; }
+    case "$idx" in *[!0-9]*) err "无效序号"; pause; return ;; esac
+    local n=$((10#$idx - 1))   # 10# 强制十进制，避免 08/09 被当八进制报错
+    { [ "$n" -lt 0 ] || [ "$n" -ge "${#SITE_FILES[@]}" ]; } && { err "无效序号"; pause; return; }
+    local f="${SITE_FILES[$n]}"
+    [ -f "$f" ] || { err "无效序号"; pause; return; }
+    if [ "${SITE_KIND[$n]}" = "managed" ]; then
+        manage_managed_site "$f"
+    else
+        manage_external_site "$f"
+    fi
+}
 
+# 本脚本托管站点的详情管理（原 manage_reverse_proxy 主体）
+manage_managed_site() {
+    local f="$1"
     local domain target maxbody cache ssl crt key allow_ips
     domain=$(get_meta domain "$f"); target=$(get_meta target "$f")
     maxbody=$(get_meta maxbody "$f"); cache=$(get_meta cache "$f")
@@ -894,6 +987,173 @@ manage_reverse_proxy() {
                 fi
             fi
             ;;
+        *) return ;;
+    esac
+    pause
+}
+
+# ------------------- 外部反代（非本脚本创建）的管理 -------------------------
+# 备份文件到 BACKUP_DIR，成功则在 stdout 输出备份路径
+backup_file() {
+    local src="$1" ts dst
+    mkdir -p "$BACKUP_DIR" 2>/dev/null
+    ts=$(date +%s 2>/dev/null)
+    dst="$BACKUP_DIR/$(basename "$src").${ts}.$$.bak"
+    cp -f "$src" "$dst" 2>/dev/null && echo "$dst"
+}
+
+# 启用/停用：兼容 sites-available 软链模型与 conf.d 改名模型
+toggle_external_site() {
+    local real; real=$(readlink -f "$1" 2>/dev/null || echo "$1")
+    local state; state=$(_site_enabled "$1")
+    case "$real" in
+        "$SITES_AVAIL"/*)
+            local base e link=""; base=$(basename "$real")
+            if [ "$state" = enabled ]; then
+                for e in "$SITES_ENABLED"/*; do
+                    [ -e "$e" ] || continue
+                    [ "$(readlink -f "$e" 2>/dev/null)" = "$real" ] && { link="$e"; rm -f "$e"; }
+                done
+                if reload_nginx; then ok "已停用 $base"
+                elif [ -n "$link" ]; then ln -sf "$real" "$link"; reload_nginx; err "停用后测试失败，已回滚。"; fi
+            else
+                ln -sf "$real" "$SITES_ENABLED/$base"
+                if reload_nginx; then ok "已启用 $base"
+                else rm -f "$SITES_ENABLED/$base"; reload_nginx; err "启用后测试失败，已回滚。"; fi
+            fi ;;
+        "$NGINX_CONF_D"/*.conf)
+            mv -f "$real" "${real}.disabled"
+            if reload_nginx; then ok "已停用（$(basename "$real") → .disabled）"
+            else mv -f "${real}.disabled" "$real"; reload_nginx; err "停用后测试失败，已回滚。"; fi ;;
+        "$NGINX_CONF_D"/*.conf.disabled)
+            mv -f "$real" "${real%.disabled}"
+            if reload_nginx; then ok "已启用（$(basename "${real%.disabled}")）"
+            else mv -f "${real%.disabled}" "$real"; reload_nginx; err "启用后测试失败，已回滚。"; fi ;;
+        *)
+            warn "该配置在非标准位置（$real），不支持自动启用/停用，请手动处理。" ;;
+    esac
+}
+
+delete_external_site() {
+    local real; real=$(readlink -f "$1" 2>/dev/null || echo "$1")
+    local domain; domain=$(_first_server_name "$1")
+    local yn; read -rp "  确认删除外部配置 ${domain:-$real}？会先备份。(y/N): " yn
+    [ "$yn" = "y" ] || [ "$yn" = "Y" ] || return
+    local bak e; bak=$(backup_file "$real")
+    for e in "$SITES_ENABLED"/*; do
+        [ -e "$e" ] || continue
+        [ "$(readlink -f "$e" 2>/dev/null)" = "$real" ] && rm -f "$e"
+    done
+    rm -f "$real"
+    reload_nginx && ok "已删除（备份在 ${bak:-$BACKUP_DIR}）"
+}
+
+# 导入接管：解析外部配置 → 备份 → 用本脚本模板重写为受管站点 → reload（失败回滚）
+import_external_site() {
+    local real; real=$(readlink -f "$1" 2>/dev/null || echo "$1")
+
+    local ndom; ndom=$(_distinct_domains "$real")
+    if [ "${ndom:-0}" -gt 1 ]; then
+        err "该文件含 $ndom 个不同域名，自动导入会用单域名模板覆盖、丢失其它站点。"
+        warn "请先手动拆成「一个域名一个文件」再导入。本次仅支持查看/启用停用/删除。"
+        return
+    fi
+
+    local domain target maxbody ssl crt key allow_ips body was_enabled
+    body=$(_nocomment "$real")
+    domain=$(_first_server_name "$real"); target=$(_first_proxy_pass "$real")
+    [ -z "$domain" ] && { err "解析不到 server_name，无法导入。"; return; }
+    [ -z "$target" ] && { err "解析不到 proxy_pass 目标，无法导入。"; return; }
+    was_enabled=$(_site_enabled "$real")
+
+    maxbody=$(echo "$body" | grep -oE 'client_max_body_size[[:space:]]+[0-9]+' | grep -oE '[0-9]+' | head -1)
+    [ -z "$maxbody" ] && maxbody=1024
+    crt=$(echo "$body" | grep -oE 'ssl_certificate[[:space:]]+[^;]+' | grep -v ssl_certificate_key \
+            | sed -E 's/ssl_certificate[[:space:]]+//' | head -1)
+    key=$(echo "$body" | grep -oE 'ssl_certificate_key[[:space:]]+[^;]+' \
+            | sed -E 's/ssl_certificate_key[[:space:]]+//' | head -1)
+    if [ -n "$crt" ] && [ -n "$key" ]; then ssl=file; else ssl=none; crt=""; key=""; fi
+    allow_ips=$(echo "$body" | grep -oE 'allow[[:space:]]+[^;]+' | sed -E 's/allow[[:space:]]+//' | sort -u | tr '\n' ' ')
+    local -a _ai; read -ra _ai <<< "$allow_ips"; allow_ips="${_ai[*]}"
+
+    echo "  解析结果（导入后按本脚本模板重写）："
+    echo "    域名     : $domain"
+    echo "    目标     : $target"
+    echo "    上限     : ${maxbody}m"
+    echo "    证书     : $ssl${crt:+（$crt）}"
+    echo "    缓存     : none（导入后可在受管菜单调整）"
+    echo "    IP白名单 : ${allow_ips:-（无）}"
+    warn "导入会用模板重写该站点，原文件的自定义指令将丢失（会先自动备份）。"
+    local yn; read -rp "  确认导入接管？(y/N): " yn
+    [ "$yn" = "y" ] || [ "$yn" = "Y" ] || { info "已取消"; return; }
+
+    local bak; bak=$(backup_file "$real")
+    [ -z "$bak" ] && { err "备份失败，已中止（未改动任何文件）。"; return; }
+
+    mkdir -p "$SITES_AVAIL" "$SITES_ENABLED"
+    ensure_sites_enabled_include
+    ensure_global_conf
+    local managed="$SITES_AVAIL/$domain.conf"
+    render_site_file "$domain" "$target" "$maxbody" "none" "$ssl" "$crt" "$key" "$allow_ips"
+
+    # 原文件 ≠ 受管文件 → 停用原文件，避免 server_name 重复冲突
+    local disabled_old="" e
+    if [ "$real" != "$managed" ]; then
+        case "$real" in
+            "$NGINX_CONF_D"/*.conf) mv -f "$real" "${real}.disabled" && disabled_old="${real}.disabled" ;;
+            *)
+                for e in "$SITES_ENABLED"/*; do
+                    [ -e "$e" ] || continue
+                    [ "$(readlink -f "$e" 2>/dev/null)" = "$real" ] && rm -f "$e"
+                done
+                rm -f "$real"; disabled_old="removed" ;;
+        esac
+    fi
+
+    if reload_nginx; then
+        ok "已导入接管：$domain 现由本脚本管理（菜单里可改目标/缓存/证书/白名单）。"
+        info "原配置已备份：$bak"
+        case "$disabled_old" in
+            *.disabled) info "原文件已停用：$disabled_old" ;;
+            removed)    info "原文件已移除（见上方备份）" ;;
+        esac
+    else
+        err "导入后 nginx 测试失败，正在回滚..."
+        rm -f "$managed" "$SITES_ENABLED/$domain.conf"
+        case "$disabled_old" in
+            *.disabled) mv -f "$disabled_old" "$real" 2>/dev/null ;;
+            removed)    cp -f "$bak" "$real" 2>/dev/null ;;
+        esac
+        [ "$real" = "$managed" ] && cp -f "$bak" "$real" 2>/dev/null   # 同路径被模板覆盖，恢复
+        if [ "$was_enabled" = enabled ]; then
+            case "$real" in "$SITES_AVAIL"/*) ln -sf "$real" "$SITES_ENABLED/$(basename "$real")" ;; esac
+        fi
+        reload_nginx
+        err "已回滚到导入前状态（备份保留：$bak）。请检查原配置后重试。"
+    fi
+}
+
+manage_external_site() {
+    local f="$1"
+    local domain target enabled
+    domain=$(_first_server_name "$f"); target=$(_first_proxy_pass "$f")
+    enabled=$(_site_enabled "$f")
+    echo "  外部反代（非本脚本创建）"
+    echo "    域名： ${domain:-（无 server_name）}"
+    echo "    目标： ${target:-?}"
+    echo "    文件： $f"
+    echo "    状态： $enabled"
+    echo "    1) 查看完整配置"
+    echo "    2) 启用 / 停用"
+    echo "    3) 删除（先备份）"
+    echo "    4) 导入接管为本脚本管理（可改目标/缓存/证书/IP白名单）"
+    echo "    0) 返回"
+    local op; read -rp "  选择: " op
+    case "$op" in
+        1) echo "------------------------------------------"; cat "$f"; echo "------------------------------------------" ;;
+        2) toggle_external_site "$f" ;;
+        3) delete_external_site "$f" ;;
+        4) import_external_site "$f" ;;
         *) return ;;
     esac
     pause
