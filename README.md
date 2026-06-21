@@ -22,14 +22,19 @@
 
 ## 一键安装 / 运行
 
+root 用户（推荐，脚本本就要求 root）：
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/J606y/nginx-rp/main/nginx-rp.sh | sudo bash
+bash <(curl -fsSL https://raw.githubusercontent.com/J606y/nginx-rp/main/nginx-rp.sh)
 ```
 
-或下载后运行：
+> 用进程替换 `<(...)` 而不是 `curl | bash`：管道形式会把脚本本身当成标准输入，
+> 菜单的 `read` 读不到你的键盘输入，表现为「卡住 / 没反应」。
+
+非 root 用户先下载再用 sudo 运行（`sudo` 配进程替换可能因关闭文件描述符而失败，故分两步）：
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/J606y/nginx-rp/main/nginx-rp.sh
+curl -fsSL https://raw.githubusercontent.com/J606y/nginx-rp/main/nginx-rp.sh -o nginx-rp.sh
 sudo bash nginx-rp.sh
 ```
 

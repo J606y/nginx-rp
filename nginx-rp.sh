@@ -9,10 +9,11 @@
 #  目标环境：Debian / Ubuntu + 系统 nginx（apt / systemd），nginx >= 1.25
 #  适用场景：边缘 nginx 反代到源站（如某后端 origin:5244 视频流）
 #
-#  一键安装/运行：
-#    curl -fsSL https://raw.githubusercontent.com/J606y/nginx-rp/main/nginx-rp.sh | sudo bash
-#  或下载后运行：
-#    sudo bash nginx-rp.sh        # 安装快捷命令后，以后直接输入： n
+#  一键安装/运行（root，用进程替换 <(...) 避免管道把脚本当 stdin 导致菜单卡住）：
+#    bash <(curl -fsSL https://raw.githubusercontent.com/J606y/nginx-rp/main/nginx-rp.sh)
+#  非 root 先下载再运行（sudo 配进程替换可能因关闭文件描述符失败）：
+#    curl -fsSL .../nginx-rp.sh -o nginx-rp.sh && sudo bash nginx-rp.sh
+#  装好后以后直接输入快捷命令： n
 # ============================================================================
 
 set -o pipefail
