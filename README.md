@@ -1,13 +1,13 @@
 # nginx-rp
 
-一个面向 **Debian / Ubuntu** 的 Nginx 反向代理一键脚本：交互式菜单完成「装 Nginx → 配反代 → 自动 HTTPS 证书 → 自动续签 → 缓存档位 → 安全收紧」整条链路，适合把边缘 Nginx 反代到源站（如某后端 `origin:5244` 的视频流）。
+一个面向 **Debian / Ubuntu** 的 Nginx 反向代理一键脚本：交互式菜单完成「装 Nginx → 配反代 → 自动 HTTPS 证书 → 自动续签 → 缓存档位 → 安全收紧」整条链路，适合把边缘 Nginx 反代到源站（如某后端 `origin:8080` 的视频流）。
 
-> 基于「一点科技 Nginx 反代脚本」的功能，额外增加了 acme.sh 自动签发/续签、按站点的缓存开关、HTTPS 回源、禁 IP 直连、后端端口封锁与脚本自更新。
+> 集成 acme.sh 自动签发 / 续签、按站点的缓存档位、HTTPS 回源、禁 IP 直连、后端端口封锁与脚本自更新，开箱即用。
 
 ## 功能
 
 - **安装 Nginx**：自动补 `nginx.conf` 对 `sites-enabled` 的 include、放行 80/443 防火墙（ufw / firewalld / iptables 自适应）；已有 Nginx（含 Docker / 手动启动）不重复安装、不抢端口，只平滑重载。
-- **配置反向代理**：按域名生成站点配置，支持 `http://127.0.0.1:5244` 本机后端，也支持 `https://源站域名` 回源（自动补 SNI 与源站 Host，避免串站）。
+- **配置反向代理**：按域名生成站点配置，支持 `http://127.0.0.1:8080` 本机后端，也支持 `https://源站域名` 回源（自动补 SNI 与源站 Host，避免串站）。
 - **自动 HTTPS 证书**（acme.sh，默认 Let's Encrypt）：
   - HTTP-01（webroot，需 80 可达）
   - DNS API（Cloudflare / 阿里云 / 腾讯云 DNSPod，支持泛域名 `*.domain`）
@@ -84,7 +84,7 @@ n
 
 ## 致谢
 
-功能参考并扩展自「一点科技 Nginx 反代脚本」。
+由 [Claude Code](https://claude.com/claude-code) 编写。
 
 ## License
 

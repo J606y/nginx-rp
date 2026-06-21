@@ -8,7 +8,7 @@
 #    - 针对不同站点的 Nginx 缓存开关（无缓存 / 普通缓存 / 视频分片缓存）
 #
 #  目标环境：Debian / Ubuntu + 系统 nginx（apt / systemd），nginx >= 1.25
-#  适用场景：边缘 nginx 反代到源站（如某后端 origin:5244 视频流）
+#  适用场景：边缘 nginx 反代到源站（如某后端 origin:8080 视频流）
 #
 #  一键安装/运行（root，用进程替换 <(...) 避免管道把脚本当 stdin 导致菜单卡住）：
 #    bash <(curl -fsSL https://raw.githubusercontent.com/J606y/nginx-rp/main/nginx-rp.sh)
@@ -208,9 +208,9 @@ open_firewall() {
 }
 
 # ------------------- 后端端口直连封锁（仅经域名/Nginx 访问） -----------------
-# 反代建好后，常希望禁止公网再用 http://IP:端口 直连后端（如 OpenList 5244）。
+# 反代建好后，常希望禁止公网再用 http://IP:端口 直连后端（如后端 8080）。
 # 做法：iptables 丢弃「非回环」入站到该端口的流量，保留 lo 让 Nginx(127.0.0.1) 仍可访问。
-# 注意：Docker 发布的端口（compose 里 5244:5244）走 DOCKER-USER 链，绕过 INPUT/ufw，
+# 注意：Docker 发布的端口（compose 里 8080:8080）走 DOCKER-USER 链，绕过 INPUT/ufw，
 #       所以必须同时在 DOCKER-USER 链下规则，否则封不住。
 
 # 需要操作的链：DOCKER-USER（存在则优先，管 Docker 发布端口）+ INPUT（管本机服务）
@@ -548,7 +548,7 @@ render_site_file() {
 
     # HTTPS 回源（target 为 https://域名）：必须补发 SNI、且把 Host 改成源站域名——
     # 否则源站握手缺 SNI 会拿到默认证书，按 server_name 又匹配不到边缘域名 → 失败/串站。
-    # http:// 本机后端则保持 Host $host（OpenList 靠它生成对外链接）。
+    # http:// 本机后端则保持 Host $host（部分后端靠它生成对外链接）。
     local host_hdr='$host' ssl_block='' up_hostport up_host
     case "$target" in
         https://*)
@@ -667,7 +667,7 @@ get_meta() {  # get_meta <key> <file>
 choose_cache_mode() {
     # 结果写入全局变量 CACHE_MODE
     echo "  请选择该站点的缓存模式：" >&2
-    echo "    1) 无缓存      —— 关闭缓冲，纯流媒体/直连源站（如 OpenList 视频，推荐）" >&2
+    echo "    1) 无缓存      —— 关闭缓冲，纯流媒体/直连源站（推荐）" >&2
     echo "    2) 普通缓存    —— 缓存网页/静态，Range 与视频自动绕过" >&2
     echo "    3) 视频分片缓存 —— slice 切片缓存 Range 响应（源站直链带签名时命中率低，慎用）" >&2
     local c; read -rp "  输入 [1-3]（默认1）: " c
@@ -737,7 +737,7 @@ configure_reverse_proxy() {
     local domain target maxbody created=0
     read -rp "请输入域名（如 v.example.com）: " domain
     [ -z "$domain" ] && { err "域名不能为空"; pause; return; }
-    read -rp "请输入反代目标（如 http://127.0.0.1:5244，也支持 https://源站域名 回源）: " target
+    read -rp "请输入反代目标（如 http://127.0.0.1:8080，也支持 https://源站域名 回源）: " target
     [ -z "$target" ] && { err "目标不能为空"; pause; return; }
     read -rp "客户端最大请求体大小 MB（上传用，默认 1024）: " maxbody
     [ -z "$maxbody" ] && maxbody=1024
@@ -748,14 +748,14 @@ configure_reverse_proxy() {
 
     # 反代建好后的两个收尾询问：
     if [ "$created" = 1 ]; then
-        # (a) 后端在本机时：是否封后端端口(如 5244)的公网直连
+        # (a) 后端在本机时：是否封后端端口(如 8080)的公网直连
         local _hp _host
         _hp="${target#*://}"; _hp="${_hp%%/*}"; _host="${_hp%%:*}"
         case "$_host" in
             127.0.0.1|localhost|::1|0.0.0.0)
                 echo
                 local _yn
-                read -rp "是否封锁后端端口的公网直连(如 IP:5244)，仅允许经 Nginx？(y/N): " _yn
+                read -rp "是否封锁后端端口的公网直连(如 IP:8080)，仅允许经 Nginx？(y/N): " _yn
                 case "$_yn" in y|Y) restrict_backend_port "$target" ;; esac
                 ;;
         esac
@@ -877,7 +877,7 @@ uninstall_nginx() {
 # ------------------- 后端端口直连封锁开关 -----------------------------------
 port_block_menu() {
     echo "后端端口直连封锁：禁止公网用 IP:端口 直连后端（保留本机回环给 Nginx）"
-    local port; read -rp "  输入后端端口（如 5244，回车返回）: " port
+    local port; read -rp "  输入后端端口（如 8080，回车返回）: " port
     [ -z "$port" ] && return
     case "$port" in *[!0-9]*) err "端口需为数字"; pause; return ;; esac
     if backend_port_blocked "$port"; then
