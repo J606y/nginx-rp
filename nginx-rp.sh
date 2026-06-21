@@ -930,21 +930,44 @@ manage_menu() {
     done
 }
 
+# ----------------------------- 顶部信息栏 -----------------------------------
+banner() {
+    local nstat ver sites
+    if command -v nginx >/dev/null 2>&1; then
+        ver=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        nstat="已安装${ver:+ ($ver)}"
+    else
+        nstat="未安装"
+    fi
+    sites=$(grep -lE "(nginx-rp|1keji-rp) BEGIN" "$SITES_AVAIL"/*.conf 2>/dev/null | wc -l | tr -d ' ')
+    clear
+    printf '\033[36m'
+    cat <<'EOF'
+ _ __   __ _ (_) _ __   __  __        _ __  _ __
+| '_ \ / _` || || '_ \  \ \/ / _____ | '__|| '_ \
+| | | | (_| || || | | |  >  < |_____|| |   | |_) |
+|_| |_|\__, ||_||_| |_| /_/\_\       |_|   | .__/
+       |___/                               |_|
+EOF
+    printf '\033[0m'
+    echo "  Nginx 反向代理一键脚本 · acme 自动证书 / 续签 / 缓存"
+    echo "  项目: https://github.com/J606y/nginx-rp"
+    echo "  作者: J606y · 由 Claude Code 编写"
+    printf "  Nginx: %s     已配置站点: %s 个\n" "$nstat" "$sites"
+    echo "=================================================="
+}
+
 # ----------------------------- 主菜单 ---------------------------------------
 main_menu() {
     while true; do
-        clear
-        c_green "=================================="
-        c_green "        Nginx 反向代理脚本"
-        c_green "  acme 自动证书 · 自动续签 · 缓存"
-        c_green "=================================="
+        banner
         echo "  1. 安装 Nginx"
         echo "  2. 配置反向代理"
         echo "  3. 管理反向代理"
         echo "  4. 卸载 Nginx"
         echo "  5. 更新本脚本（拉 GitHub 最新）"
         echo "  0. 退出"
-        echo "----------------------------------"
+        echo "--------------------------------------------------"
         echo "  提示：下次直接输入  $SHORTCUT_CMD  即可打开本菜单"
         local opt; read -rp "请选择一个选项 [0-5]: " opt
         case "$opt" in
