@@ -21,11 +21,11 @@ set -o pipefail
 # ----------------------------- 全局变量 -------------------------------------
 SITES_AVAIL="/etc/nginx/sites-available"
 SITES_ENABLED="/etc/nginx/sites-enabled"
-GLOBAL_CONF="/etc/nginx/conf.d/00-1keji-rp.conf"
+GLOBAL_CONF="/etc/nginx/conf.d/00-nginx-rp.conf"
 DENY_IP_CONF="/etc/nginx/conf.d/00-deny-direct-ip.conf"   # 禁止用 IP 直连的兜底 server
 CERT_DIR="/etc/nginx/certs"
 ACME_WEBROOT="/var/www/acme"
-CACHE_DIR="/var/cache/nginx/1keji_rp"
+CACHE_DIR="/var/cache/nginx/nginx_rp"
 ACME_HOME="$HOME/.acme.sh"
 ACME="$ACME_HOME/acme.sh"
 REQUIRED_PORTS=(80 443)
@@ -345,12 +345,15 @@ disable_deny_ip() {
 # ----------------------------- 全局配置 -------------------------------------
 # 写入 http 上下文的公共配置：缓存区、websocket upgrade map、媒体类型跳过缓存 map
 ensure_global_conf() {
+    # 兼容旧版（曾用 1keji 命名）：删掉遗留的全局配置，否则它与新文件重复定义
+    # rpcache 缓存区 / map，会让 nginx -t 因重复声明失败。待各机迁移完可移除本行。
+    rm -f /etc/nginx/conf.d/00-1keji-rp.conf 2>/dev/null
     mkdir -p "$ACME_WEBROOT" "$CACHE_DIR" "$CERT_DIR"
     id www-data >/dev/null 2>&1 && chown -R www-data:www-data "$CACHE_DIR" 2>/dev/null
     cat > "$GLOBAL_CONF" <<'EOF'
 # 由 nginx-rp.sh 管理，请勿手动编辑。
 # 反代缓存区（普通缓存 / 视频分片缓存共用）
-proxy_cache_path /var/cache/nginx/1keji_rp levels=1:2 keys_zone=rpcache:100m max_size=10g inactive=7d use_temp_path=off;
+proxy_cache_path /var/cache/nginx/nginx_rp levels=1:2 keys_zone=rpcache:100m max_size=10g inactive=7d use_temp_path=off;
 
 # WebSocket: 根据 Upgrade 头决定 Connection
 map $http_upgrade $connection_upgrade {
@@ -557,7 +560,7 @@ render_site_file() {
 
     # 元信息（manage 解析用）
     {
-        echo "# ===== 1keji-rp BEGIN ====="
+        echo "# ===== nginx-rp BEGIN ====="
         echo "# domain=$domain"
         echo "# target=$target"
         echo "# maxbody=$maxbody"
@@ -565,7 +568,7 @@ render_site_file() {
         echo "# ssl=$ssl"
         echo "# crt=$crt"
         echo "# key=$key"
-        echo "# ===== 1keji-rp END ====="
+        echo "# ===== nginx-rp END ====="
     } > "$file"
 
     if [ "$ssl" = "none" ]; then
@@ -772,7 +775,7 @@ list_sites() {
     SITE_FILES=()
     for f in "$SITES_AVAIL"/*.conf; do
         [ -e "$f" ] || continue
-        grep -q "1keji-rp BEGIN" "$f" || continue
+        grep -qE "(nginx-rp|1keji-rp) BEGIN" "$f" || continue   # 1keji-rp：兼容旧版站点，重渲染后自动迁移到新标记
         local d t c s
         d=$(get_meta domain "$f"); t=$(get_meta target "$f")
         c=$(get_meta cache "$f");  s=$(get_meta ssl "$f")

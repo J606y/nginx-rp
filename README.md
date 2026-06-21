@@ -70,10 +70,10 @@ n
 | 路径 | 说明 |
 | --- | --- |
 | `/etc/nginx/sites-available/<域名>.conf` | 各站点配置（含本脚本元信息注释，用于回读管理） |
-| `/etc/nginx/conf.d/00-1keji-rp.conf` | 公共配置：缓存区、WebSocket map、媒体跳过缓存 map |
+| `/etc/nginx/conf.d/00-nginx-rp.conf` | 公共配置：缓存区、WebSocket map、媒体跳过缓存 map |
 | `/etc/nginx/conf.d/00-deny-direct-ip.conf` | 「禁止 IP 直连」兜底 server（开启后存在） |
 | `/etc/nginx/certs/<域名>/` | 安装到 Nginx 的证书（fullchain.pem / key.pem） |
-| `/var/cache/nginx/1keji_rp` | 反代缓存目录 |
+| `/var/cache/nginx/nginx_rp` | 反代缓存目录 |
 | `~/.acme.sh/` | acme.sh 与自动续签 cron |
 
 ## 注意
