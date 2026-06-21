@@ -1037,15 +1037,18 @@ toggle_external_site() {
 delete_external_site() {
     local real; real=$(readlink -f "$1" 2>/dev/null || echo "$1")
     local domain; domain=$(_first_server_name "$1")
-    local yn; read -rp "  确认删除外部配置 ${domain:-$real}？会先备份。(y/N): " yn
+    local yn; read -rp "  确认删除外部配置 ${domain:-$real}？(y/N): " yn
     [ "$yn" = "y" ] || [ "$yn" = "Y" ] || return
-    local bak e; bak=$(backup_file "$real")
+    local bak="" b; read -rp "  删除前先备份原文件？(Y/n): " b
+    case "$b" in n|N) : ;; *) bak=$(backup_file "$real") ;; esac
+    local e
     for e in "$SITES_ENABLED"/*; do
         [ -e "$e" ] || continue
         [ "$(readlink -f "$e" 2>/dev/null)" = "$real" ] && rm -f "$e"
     done
     rm -f "$real"
-    reload_nginx && ok "已删除（备份在 ${bak:-$BACKUP_DIR}）"
+    if [ -n "$bak" ]; then reload_nginx && ok "已删除（备份在 $bak）"
+    else                  reload_nginx && ok "已删除（未备份）"; fi
 }
 
 # 导入接管：解析外部配置 → 备份 → 用本脚本模板重写为受管站点 → reload（失败回滚）
