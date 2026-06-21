@@ -615,7 +615,10 @@ render_site_file() {
             ;;
     esac
 
-    # 元信息（manage 解析用）
+    # 元信息（manage 解析用）。整份内容先写临时文件，最后原子 mv 到位：
+    # 避免「先 > 写元信息、再 >> 追加 server 块」中途被打断（Ctrl-C/断连/信号）
+    # 留下只有注释、没有 server 块的半截文件（会导致站点失效且从列表消失）。
+    local tmp="$file.tmp.$$"
     {
         echo "# ===== nginx-rp BEGIN ====="
         echo "# domain=$domain"
@@ -627,10 +630,10 @@ render_site_file() {
         echo "# key=$key"
         echo "# allow_ips=$allow_ips"
         echo "# ===== nginx-rp END ====="
-    } > "$file"
+    } > "$tmp"
 
     if [ "$ssl" = "none" ]; then
-        cat >> "$file" <<EOF
+        cat >> "$tmp" <<EOF
 
 server {
     listen 80;
@@ -660,7 +663,7 @@ $cache_block
 }
 EOF
     else
-        cat >> "$file" <<EOF
+        cat >> "$tmp" <<EOF
 
 server {
     listen 80;
@@ -712,6 +715,7 @@ $cache_block
 EOF
     fi
 
+    mv -f "$tmp" "$file"
     ln -sf "$file" "$SITES_ENABLED/$domain.conf"
 }
 
@@ -876,14 +880,22 @@ _site_enabled() {
 # 输出每行：file|kind(managed/external)|domain|target|enabled
 discover_proxies() {
     local f kind domain target enabled
+    local is_managed
     while IFS= read -r f; do
         [ -f "$f" ] || continue
         case "$f" in *~|*.bak|*.save|*.orig|*.dpkg-*|*.ucf-*|*.rpmsave|*.rpmnew) continue ;; esac  # 跳过备份/编辑器残file
-        _nocomment "$f" | grep -q 'proxy_pass' || continue   # 必须是反代
-        _nocomment "$f" | grep -q 'server'     || continue   # 且含 server 块
-        if grep -qE "(nginx-rp|1keji-rp) BEGIN" "$f"; then kind=managed; else kind=external; fi
-        domain=$(_first_server_name "$f"); [ -z "$domain" ] && domain="(无 server_name)"
-        target=$(_first_proxy_pass "$f");  [ -z "$target" ] && target="?"
+        is_managed=0; grep -qE "(nginx-rp|1keji-rp) BEGIN" "$f" && is_managed=1
+        if [ "$is_managed" = 0 ]; then
+            _nocomment "$f" | grep -q 'proxy_pass' || continue   # 外部文件必须像反代
+            _nocomment "$f" | grep -q 'server'     || continue
+            kind=external
+        else
+            kind=managed   # 受管文件总是列出（即便 server 块损坏/缺失，也要显示以便修复，不能凭空消失）
+        fi
+        domain=$(_first_server_name "$f"); [ -z "$domain" ] && domain=$(get_meta domain "$f")
+        [ -z "$domain" ] && domain="(未知)"
+        target=$(_first_proxy_pass "$f");  [ -z "$target" ] && target=$(get_meta target "$f")
+        [ -z "$target" ] && target="?"
         enabled=$(_site_enabled "$f")
         printf '%s|%s|%s|%s|%s\n' "$f" "$kind" "$domain" "$target" "$enabled"
     done < <(_candidate_conf_files)
