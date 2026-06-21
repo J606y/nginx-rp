@@ -409,6 +409,32 @@ install_nginx() {
     pause
 }
 
+# ----------------------------- 更新 Nginx -----------------------------------
+# 升级 apt 安装的系统 Nginx 到软件源最新版本（仅升级 nginx 相关包，不动其它软件）。
+# 说明：HUP 重载只换配置不换二进制；apt 升级 nginx 时其 postinst 通常会自动重启
+#       systemd 托管的 nginx 让新版本生效，这里再 reload 一次确保配置无误并在线。
+update_nginx() {
+    if ! command -v nginx >/dev/null 2>&1; then
+        err "未检测到 Nginx，请先安装（菜单 1）"; pause; return
+    fi
+    local old; old=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    info "当前 Nginx 版本：${old:-未知}，更新软件源并检查升级..."
+    apt-get update -y
+    # 同时升级 nginx 元包与实际承载二进制的 nginx-core / nginx-common（与卸载逻辑对应）
+    if ! apt-get install -y --only-upgrade nginx nginx-common nginx-core; then
+        err "升级失败，请检查软件源 / 网络后重试。"; pause; return
+    fi
+    local new; new=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [ -n "$new" ] && [ "$old" = "$new" ]; then
+        ok "已是软件源最新版本（${new}），无需升级。"
+    else
+        ok "Nginx 已升级：${old:-?} -> ${new:-?}"
+        warn "若运行中的进程仍是旧版本（非 systemd / Docker 自管的 nginx），请手动重启使新二进制生效。"
+    fi
+    reload_nginx
+    pause
+}
+
 # ----------------------------- 确保 acme.sh ---------------------------------
 # 邮箱格式校验：local@domain.tld，且排除保留/不可投递域名（localhost/.local/.test...）。
 # Let's Encrypt 会对 contact 邮箱做解析校验，非法地址会以 invalidContact 拒绝注册。
@@ -532,8 +558,20 @@ install_cert_to_nginx() {
 # ----------------------------- 渲染站点配置 ---------------------------------
 # 参数: domain target maxbody(MB) cache(none|normal|slice) ssl(none|le|dns|file) crt key
 render_site_file() {
-    local domain="$1" target="$2" maxbody="$3" cache="$4" ssl="$5" crt="$6" key="$7"
+    local domain="$1" target="$2" maxbody="$3" cache="$4" ssl="$5" crt="$6" key="$7" allow_ips="$8"
     local file="$SITES_AVAIL/$domain.conf"
+
+    # IP 访问白名单块：仅允许 allow_ips 里的 IP/网段访问 location /（其余 403）。
+    # 用途：回源域名只放行边缘 Nginx 的出口 IP。基于直连来源 $remote_addr 判断——
+    # 源站直接面向边缘机时有效；源站前若再套 CDN/代理则看不到真实边缘 IP。
+    # 只加在 location /，不动 acme-challenge，证书签发/续签不受影响。
+    local access_block="" _aip
+    if [ -n "$allow_ips" ]; then
+        for _aip in $allow_ips; do
+            access_block+="        allow ${_aip};"$'\n'
+        done
+        access_block+="        deny all;"$'\n'
+    fi
 
     # 缓存指令块（$'' 内 nginx 变量保持字面量，\n 为真实换行）
     local cache_block
@@ -569,6 +607,7 @@ render_site_file() {
         echo "# ssl=$ssl"
         echo "# crt=$crt"
         echo "# key=$key"
+        echo "# allow_ips=$allow_ips"
         echo "# ===== nginx-rp END ====="
     } > "$file"
 
@@ -586,7 +625,7 @@ server {
     }
 
     location / {
-        proxy_pass $target;
+$access_block        proxy_pass $target;
         proxy_http_version 1.1;
         proxy_set_header Host $host_hdr;$ssl_block
         proxy_set_header X-Real-IP \$remote_addr;
@@ -637,7 +676,7 @@ server {
     }
 
     location / {
-        proxy_pass $target;
+$access_block        proxy_pass $target;
         proxy_http_version 1.1;
         proxy_set_header Host $host_hdr;$ssl_block
         proxy_set_header X-Real-IP \$remote_addr;
@@ -684,7 +723,7 @@ choose_cache_mode() {
 # 用法: apply_https_cert <domain> <target> <maxbody> <cache>
 # 返回: 0=已写入并启用了可用站点配置（HTTP 或 HTTPS）；1=失败/取消，未写可用配置
 apply_https_cert() {
-    local domain="$1" target="$2" maxbody="$3" cache="$4"
+    local domain="$1" target="$2" maxbody="$3" cache="$4" allow_ips="$5"
     echo "  请选择 HTTPS 证书方式："
     echo "    1) acme.sh 自动申请（HTTP-01，需 80 端口可达，推荐）"
     echo "    2) acme.sh 自动申请（DNS API，支持泛域名）"
@@ -693,7 +732,7 @@ apply_https_cert() {
     local s; read -rp "  输入 [1-4]（默认1）: " s
     case "$s" in
         4)
-            render_site_file "$domain" "$target" "$maxbody" "$cache" "none" "" ""
+            render_site_file "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips"
             reload_nginx && { ok "已设为仅 HTTP：http://$domain"; return 0; }
             return 1 ;;
         3)
@@ -701,7 +740,7 @@ apply_https_cert() {
             read -rp "  证书 fullchain 路径: " crt
             read -rp "  私钥 key 路径: " key
             if [ ! -f "$crt" ] || [ ! -f "$key" ]; then err "证书文件不存在"; return 1; fi
-            render_site_file "$domain" "$target" "$maxbody" "$cache" "file" "$crt" "$key"
+            render_site_file "$domain" "$target" "$maxbody" "$cache" "file" "$crt" "$key" "$allow_ips"
             reload_nginx && { ok "已启用（本地证书）：https://$domain"; return 0; }
             return 1 ;;
         2)
@@ -710,17 +749,17 @@ apply_https_cert() {
             local prov; case "$dp" in 1) prov=cloudflare;; 2) prov=aliyun;; 3) prov=tencent;; *) err "无效"; return 1;; esac
             if issue_cert_dns "$domain" "$prov" && install_cert_to_nginx "$domain"; then
                 render_site_file "$domain" "$target" "$maxbody" "$cache" "dns" \
-                    "$CERT_DIR/$domain/fullchain.pem" "$CERT_DIR/$domain/key.pem"
+                    "$CERT_DIR/$domain/fullchain.pem" "$CERT_DIR/$domain/key.pem" "$allow_ips"
                 reload_nginx && { ok "已启用（HTTPS + 泛域名证书）：https://$domain"; return 0; }
             fi
             err "证书申请失败。"; return 1 ;;
         *)
             # 先建/保留 HTTP 站点承载 acme challenge，再签发，最后换成 HTTPS
-            render_site_file "$domain" "$target" "$maxbody" "$cache" "none" "" ""
+            render_site_file "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips"
             reload_nginx || { err "初始 HTTP 配置失败"; return 1; }
             if issue_cert_http "$domain" && install_cert_to_nginx "$domain"; then
                 render_site_file "$domain" "$target" "$maxbody" "$cache" "le" \
-                    "$CERT_DIR/$domain/fullchain.pem" "$CERT_DIR/$domain/key.pem"
+                    "$CERT_DIR/$domain/fullchain.pem" "$CERT_DIR/$domain/key.pem" "$allow_ips"
                 reload_nginx && ok "已启用（HTTPS + 自动证书）：https://$domain"
             else
                 err "证书申请失败，已保留仅 HTTP 站点。请检查域名解析 / 80 端口可达性，或改用 DNS API / 本地证书。"
@@ -744,7 +783,7 @@ configure_reverse_proxy() {
 
     choose_cache_mode
 
-    if apply_https_cert "$domain" "$target" "$maxbody" "$CACHE_MODE"; then created=1; fi
+    if apply_https_cert "$domain" "$target" "$maxbody" "$CACHE_MODE" ""; then created=1; fi
 
     # 反代建好后的两个收尾询问：
     if [ "$created" = 1 ]; then
@@ -795,39 +834,64 @@ manage_reverse_proxy() {
     local f="${SITE_FILES[$((idx-1))]}"
     [ -z "$f" ] || [ ! -f "$f" ] && { err "无效序号"; pause; return; }
 
-    local domain target maxbody cache ssl crt key
+    local domain target maxbody cache ssl crt key allow_ips
     domain=$(get_meta domain "$f"); target=$(get_meta target "$f")
     maxbody=$(get_meta maxbody "$f"); cache=$(get_meta cache "$f")
     ssl=$(get_meta ssl "$f"); crt=$(get_meta crt "$f"); key=$(get_meta key "$f")
+    allow_ips=$(get_meta allow_ips "$f")
 
     echo "  当前： $domain -> $target  [缓存:$cache 证书:$ssl 上限:${maxbody}m]"
+    echo "         IP 白名单：${allow_ips:-未设置（任意 IP 可访问）}"
     echo "    1) 修改反代目标"
     echo "    2) 修改缓存模式"
     echo "    3) 申请/更换 HTTPS 证书（HTTP-01 / DNS / 本地证书 / 仅 HTTP）"
     echo "    4) 删除该站点"
+    echo "    5) 设置 IP 访问白名单（仅允许指定 IP 访问，回源域名用）"
     echo "    0) 返回"
     local op; read -rp "  选择: " op
     case "$op" in
         1)
             read -rp "  新目标: " target
             [ -z "$target" ] && { err "不能为空"; pause; return; }
-            render_site_file "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key"
+            render_site_file "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$allow_ips"
             reload_nginx && ok "目标已更新"
             ;;
         2)
             choose_cache_mode
-            render_site_file "$domain" "$target" "$maxbody" "$CACHE_MODE" "$ssl" "$crt" "$key"
+            render_site_file "$domain" "$target" "$maxbody" "$CACHE_MODE" "$ssl" "$crt" "$key" "$allow_ips"
             reload_nginx && ok "缓存模式已改为 $CACHE_MODE"
             ;;
         3)
             ensure_global_conf
-            apply_https_cert "$domain" "$target" "$maxbody" "$cache"
+            apply_https_cert "$domain" "$target" "$maxbody" "$cache" "$allow_ips"
             ;;
         4)
             read -rp "  确认删除 $domain ？(y/N): " yn
             if [ "$yn" = "y" ] || [ "$yn" = "Y" ]; then
                 rm -f "$f" "$SITES_ENABLED/$domain.conf"
                 reload_nginx && ok "已删除（证书保留在 $CERT_DIR/$domain）"
+            fi
+            ;;
+        5)
+            echo "  仅允许下列 IP/网段访问 $domain（空格分隔，支持 CIDR 如 1.2.3.0/24 或 IPv6）。"
+            echo "  直接回车留空 = 清除白名单，恢复任意 IP 可访问。"
+            echo "  当前：${allow_ips:-（无，任意 IP 可访问）}"
+            local newips; read -rp "  允许的 IP： " newips
+            local -a _ips; read -ra _ips <<< "$newips"; newips="${_ips[*]}"   # 压缩多余空格
+            local bad=0 ip
+            for ip in $newips; do
+                case "$ip" in *[!0-9a-fA-F:./]*) bad=1 ;; esac
+            done
+            if [ "$bad" = 1 ]; then
+                err "含非法字符，IP/网段只能包含数字、字母(IPv6)、. : / ，已取消。"
+            else
+                render_site_file "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$newips"
+                if reload_nginx; then
+                    if [ -n "$newips" ]; then ok "已设置白名单，仅允许：$newips（其它来源 403）"
+                    else ok "已清除白名单，恢复任意 IP 可访问。"; fi
+                else
+                    err "配置测试失败，请检查输入的 IP 是否合法（可重新设置或清空）。"
+                fi
             fi
             ;;
         *) return ;;
@@ -966,16 +1030,18 @@ main_menu() {
         echo "  3. 管理反向代理"
         echo "  4. 卸载 Nginx"
         echo "  5. 更新本脚本（拉 GitHub 最新）"
+        echo "  6. 更新 Nginx"
         echo "  0. 退出"
         echo "--------------------------------------------------"
         echo "  提示：下次直接输入  $SHORTCUT_CMD  即可打开本菜单"
-        local opt; read -rp "请选择一个选项 [0-5]: " opt
+        local opt; read -rp "请选择一个选项 [0-6]: " opt
         case "$opt" in
             1) install_nginx ;;
             2) configure_reverse_proxy ;;
             3) manage_menu ;;
             4) uninstall_nginx ;;
             5) self_update ;;
+            6) update_nginx ;;
             0) exit 0 ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
