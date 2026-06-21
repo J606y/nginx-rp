@@ -188,6 +188,23 @@ reload_nginx() {
     return 1
 }
 
+# 完整重启 nginx（升级二进制后必须用）：reload/HUP 只重读配置、不换二进制，且旧 master 的
+# worker 可能赖着不退继续用旧配置服务。systemctl restart 会把整个服务进程组换新，连僵尸
+# worker 一起清掉。非 systemd 环境回退到 stop + 清残留 + start。
+restart_nginx() {
+    if ! nginx -t 2>/tmp/nginx_test.log; then
+        err "Nginx 配置测试失败，未重启。错误如下："; cat /tmp/nginx_test.log; return 1
+    fi
+    if systemctl restart nginx 2>/dev/null; then
+        ok "Nginx 已重启（systemd）"; return 0
+    fi
+    # 非 systemd：停掉并清掉可能残留的旧进程，再起
+    nginx -s quit 2>/dev/null; sleep 1
+    pgrep -x nginx >/dev/null 2>&1 && { pkill -x nginx 2>/dev/null; sleep 1; }
+    if nginx 2>/dev/null; then ok "Nginx 已重启"; return 0; fi
+    err "Nginx 重启失败。"; return 1
+}
+
 # ----------------------------- 防火墙 ---------------------------------------
 open_firewall() {
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -445,11 +462,12 @@ update_nginx() {
     local new; new=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     if [ -n "$new" ] && [ "$old" = "$new" ]; then
         ok "已是软件源最新版本（${new}），无需升级。"
+        reload_nginx
     else
         ok "Nginx 已升级：${old:-?} -> ${new:-?}"
-        warn "若运行中的进程仍是旧版本（非 systemd / Docker 自管的 nginx），请手动重启使新二进制生效。"
+        info "升级后重启 nginx 让新二进制生效（reload 不换二进制，且会残留旧 worker）..."
+        restart_nginx
     fi
-    reload_nginx
     pause
 }
 
