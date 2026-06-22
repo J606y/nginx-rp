@@ -24,6 +24,7 @@ SITES_AVAIL="/etc/nginx/sites-available"
 SITES_ENABLED="/etc/nginx/sites-enabled"
 GLOBAL_CONF="/etc/nginx/conf.d/00-nginx-rp.conf"
 DENY_IP_CONF="/etc/nginx/conf.d/00-deny-direct-ip.conf"   # 禁止用 IP 直连的兜底 server
+REALIP_CONF="/etc/nginx/conf.d/00-nginx-rp-realip.conf"   # 信任上游代理、从 XFF 还原真实客户端 IP
 CERT_DIR="/etc/nginx/certs"
 BACKUP_DIR="/etc/nginx/nginx-rp-backups"   # 导入/删除外部配置前的备份目录
 NGINX_CONF_D="/etc/nginx/conf.d"           # 发现/管理外部反代时用（可被测试覆盖）
@@ -360,6 +361,89 @@ disable_deny_ip() {
     [ -f "$DENY_IP_CONF" ] || { info "未开启「禁止 IP 直连」"; return 0; }
     rm -f "$DENY_IP_CONF"
     reload_nginx && ok "已关闭「禁止 IP 直连」（IP 访问恢复默认行为）。"
+}
+
+# ------------------- 真实客户端 IP 透传（real_ip） --------------------------
+# 适用：本机 nginx 处在“可信上游代理”之后（如另一台边缘 nginx 串/并联、或 CDN 回源）。
+# 默认配置只把 XFF/X-Real-IP 头发给后端，但不还原 $remote_addr；若后端/限流按对端 IP
+# 计算，就只会看到本机/上游代理这几个 IP（典型后果：后端 limit_req 把所有人当一个 IP
+# 封，偶发 403、连登录都被挡）。开启后用 ngx_http_realip_module 从 XFF 还原真实客户端
+# IP，让日志与限流按真实访客计算。仅信任列出的上游地址，避免客户端伪造 XFF。
+realip_enabled() { [ -f "$REALIP_CONF" ]; }
+
+# 粗校验 IP / CIDR（IPv4、IPv6 均可），返回 0 合法 / 1 非法
+valid_ip_cidr() {
+    local x="$1"
+    [[ "$x" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ ]] && return 0   # IPv4 [/CIDR]
+    [[ "$x" == *:* && "$x" =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ ]] && return 0  # IPv6 [/CIDR]
+    return 1
+}
+
+enable_realip() {
+    command -v nginx >/dev/null 2>&1 || { err "请先安装 Nginx（菜单 1）"; return 1; }
+    echo "  输入“上游可信代理”的 IP 或 CIDR（你的边缘 nginx / CDN 回源地址），多个用空格分隔。"
+    echo "  例： 203.0.113.10 203.0.113.11 10.0.0.0/8"
+    local input; read -rp "  可信代理列表: " input
+    [ -z "$input" ] && { warn "未输入，已取消。"; return 1; }
+
+    local froms="" tok
+    for tok in $input; do
+        if valid_ip_cidr "$tok"; then
+            froms+="set_real_ip_from $tok;"$'\n'
+        else
+            warn "忽略无效条目：$tok"
+        fi
+    done
+    [ -z "$froms" ] && { err "没有有效的 IP/CIDR，未写入。"; return 1; }
+
+    {
+        echo "# 由 nginx-rp.sh 管理：信任下列上游代理，从 X-Forwarded-For 还原真实客户端 IP。"
+        echo "# 仅信任这些地址转发的 XFF，避免客户端伪造来源 IP。"
+        printf '%s' "$froms"
+        echo "real_ip_header    X-Forwarded-For;"
+        echo "real_ip_recursive on;"
+    } > "$REALIP_CONF"
+
+    if reload_nginx; then
+        ok "已开启 real_ip：本机日志与限流将按真实客户端 IP（X-Forwarded-For）计算。"
+        # real_ip 在 POST_READ 阶段就改写 $remote_addr，早于 allow/deny 与 limit_req。
+        warn "注意：本脚本的「IP 访问白名单」靠 allow/deny 按来源 IP 判断，开了 real_ip 后它会"
+        warn "      改用真实访客 IP 比对——“只放行边缘 IP”请改用防火墙/安全组，勿与 real_ip 同机叠加。"
+    else
+        err "配置测试失败，已回滚。"
+        rm -f "$REALIP_CONF"; reload_nginx
+        return 1
+    fi
+}
+
+disable_realip() {
+    [ -f "$REALIP_CONF" ] || { info "未开启 real_ip"; return 0; }
+    rm -f "$REALIP_CONF"
+    reload_nginx && ok "已关闭 real_ip（恢复使用直连对端 IP）。"
+}
+
+realip_menu() {
+    if realip_enabled; then
+        warn "真实客户端 IP 透传（real_ip）：当前【已开启】，可信上游："
+        grep -oE 'set_real_ip_from[[:space:]]+[^;]+' "$REALIP_CONF" 2>/dev/null \
+            | sed 's/set_real_ip_from[[:space:]]*/    /'
+        echo "    1) 重新设置可信上游"
+        echo "    2) 关闭"
+        echo "    0) 返回"
+        local op; read -rp "  选择: " op
+        case "$op" in
+            1) enable_realip ;;
+            2) disable_realip ;;
+            *) return ;;
+        esac
+    else
+        info "真实客户端 IP 透传（real_ip）：当前【未开启】"
+        echo "  适用：本机 nginx 处在上游代理（另一台边缘 nginx / CDN）之后，"
+        echo "        从 X-Forwarded-For 还原真实客户端 IP，避免后端/限流只看到代理 IP。"
+        local yn; read -rp "  现在开启？(y/N): " yn
+        case "$yn" in y|Y) enable_realip ;; esac
+    fi
+    pause
 }
 
 # ----------------------------- 全局配置 -------------------------------------
@@ -845,6 +929,20 @@ configure_reverse_proxy() {
             read -rp "是否禁止用 IP 直接访问网站，仅允许域名访问？(y/N): " _yn2
             case "$_yn2" in y|Y) enable_deny_ip ;; esac
         fi
+        # (c) 真实客户端 IP 透传(real_ip)：本机处在另一台 nginx/CDN 之后时才需要——
+        #     从 XFF 还原真实访客 IP，后端日志/限流才不会只看到上游代理那几个 IP。
+        #     已全局开过就沿用、不再追问；未开过则默认开（直连客户端的边缘机可答 n）。
+        echo
+        if realip_enabled; then
+            info "真实客户端 IP 透传(real_ip)已全局开启，本站沿用（改可信上游用菜单 3→5）。"
+        else
+            echo "若这台 nginx 在另一台 nginx / CDN 之后，建议开启「真实客户端 IP 透传」："
+            echo "从 X-Forwarded-For 还原真实访客 IP，后端日志/限流才按真实访客计算。"
+            echo "（直接面向客户端的边缘机无需开启，可回答 n。）"
+            local _yn3
+            read -rp "开启真实客户端 IP 透传 real_ip？(Y/n): " _yn3
+            case "$_yn3" in n|N) ;; *) enable_realip ;; esac
+        fi
     fi
     pause
 }
@@ -1225,7 +1323,7 @@ uninstall_nginx() {
     systemctl stop nginx 2>/dev/null
     systemctl disable nginx 2>/dev/null
     apt-get purge -y nginx nginx-common nginx-core >/dev/null 2>&1
-    rm -f "$GLOBAL_CONF" "$DENY_IP_CONF"
+    rm -f "$GLOBAL_CONF" "$DENY_IP_CONF" "$REALIP_CONF"
     rm -rf "$CACHE_DIR"
     warn "Nginx 已卸载。证书目录 $CERT_DIR 与 acme.sh($ACME_HOME) 保留，如需彻底清理请手动删除。"
     pause
@@ -1273,14 +1371,16 @@ manage_menu() {
         echo "  2. 证书 / 自动续签管理"
         echo "  3. 后端端口直连封锁（开 / 关）"
         echo "  4. 禁止用 IP 直接访问（开 / 关，仅域名可访问）"
+        echo "  5. 真实客户端 IP 透传 real_ip（多台 nginx 串/并联或 CDN 回源时用）"
         echo "  0. 返回上级"
         echo "----------------------------------------"
-        local op; read -rp "请选择 [0-4]: " op
+        local op; read -rp "请选择 [0-5]: " op
         case "$op" in
             1) manage_reverse_proxy ;;
             2) cert_menu ;;
             3) port_block_menu ;;
             4) deny_ip_menu ;;
+            5) realip_menu ;;
             0) return ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
