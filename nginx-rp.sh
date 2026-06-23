@@ -446,6 +446,56 @@ realip_menu() {
     pause
 }
 
+# 为单个受管站点设置/清除 real_ip 可信上游（与「IP 白名单」同粒度，逐站生效）。
+# 只改这一个站点的 server 块，不影响其它站，也不写全局 REALIP_CONF。
+# $1 = 站点 .conf 路径；空输入 = 关闭本站 real_ip。
+set_site_realip() {
+    local f="$1"
+    [ -f "$f" ] || { err "站点文件不存在：$f"; return 1; }
+    local domain target maxbody cache ssl crt key allow_ips realip
+    domain=$(get_meta domain "$f");   target=$(get_meta target "$f")
+    maxbody=$(get_meta maxbody "$f"); cache=$(get_meta cache "$f")
+    ssl=$(get_meta ssl "$f"); crt=$(get_meta crt "$f"); key=$(get_meta key "$f")
+    allow_ips=$(get_meta allow_ips "$f"); realip=$(get_meta realip "$f")
+
+    echo "  本站当前 real_ip 可信上游：${realip:-（未设置，不还原真实 IP）}"
+    echo "  输入「上游可信代理」的 IP/CIDR（上游边缘 nginx / CDN 回源地址），空格分隔。"
+    echo "  例： 203.0.113.10 203.0.113.11 10.0.0.0/8"
+    echo "  直接回车留空 = 关闭本站 real_ip。"
+    local input; read -rp "  可信上游： " input
+    local -a _in; read -ra _in <<< "$input"; input="${_in[*]}"   # 压缩多余空格
+
+    local froms="" tok
+    if [ -n "$input" ]; then
+        for tok in $input; do
+            if valid_ip_cidr "$tok"; then froms+="$tok "
+            else warn "忽略无效条目：$tok"; fi
+        done
+        froms="${froms% }"
+        [ -z "$froms" ] && { err "没有有效的 IP/CIDR，未改动。"; return 1; }
+
+        # 冲突防护：本站若同时用 allow/deny 锁上游 IP，real_ip 会在其之前改写
+        # $remote_addr 为真实访客 → 白名单只认上游 IP → 真实访客被 deny → 全站 403。
+        if [ -n "$allow_ips" ]; then
+            warn "本站已设 IP 访问白名单（allow/deny）：$allow_ips"
+            warn "real_ip 会在 allow/deny 之前把 \$remote_addr 改成真实访客 IP，"
+            warn "白名单只放行上游 IP → 真实访客会被判 403（你刚踩过这个坑）。"
+            warn "「只放行上游 IP」请改用云安全组 / iptables，勿与 real_ip 同站叠加。"
+            local yn; read -rp "  仍要为本站开启 real_ip？(y/N): " yn
+            case "$yn" in y|Y) : ;; *) info "已取消，未改动。"; return 1 ;; esac
+        fi
+    fi
+
+    render_site_file "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$froms"
+    if reload_nginx; then
+        if [ -n "$froms" ]; then ok "已为 $domain 开启 real_ip，可信上游：$froms"
+        else ok "已关闭 $domain 的 real_ip（恢复使用直连对端 IP）。"; fi
+    else
+        err "配置测试失败。请检查输入的 IP/CIDR 是否合法后重试。"
+        return 1
+    fi
+}
+
 # ----------------------------- 全局配置 -------------------------------------
 # 写入 http 上下文的公共配置：缓存区、websocket upgrade map、媒体类型跳过缓存 map
 ensure_global_conf() {
@@ -678,7 +728,7 @@ install_cert_to_nginx() {
 # ----------------------------- 渲染站点配置 ---------------------------------
 # 参数: domain target maxbody(MB) cache(none|normal|slice) ssl(none|le|dns|file) crt key
 render_site_file() {
-    local domain="$1" target="$2" maxbody="$3" cache="$4" ssl="$5" crt="$6" key="$7" allow_ips="$8"
+    local domain="$1" target="$2" maxbody="$3" cache="$4" ssl="$5" crt="$6" key="$7" allow_ips="$8" realip="$9"
     local file="$SITES_AVAIL/$domain.conf"
 
     # IP 访问白名单块：仅允许 allow_ips 里的 IP/网段访问 location /（其余 403）。
@@ -691,6 +741,20 @@ render_site_file() {
             access_block+="        allow ${_aip};"$'\n'
         done
         access_block+="        deny all;"$'\n'
+    fi
+
+    # real_ip 块（server 级）：本站处在可信上游（边缘 nginx / CDN）之后时，从 XFF 还原真实
+    # 客户端 IP，让本机日志/限流按真实访客计算。仅信任列出的上游，避免客户端伪造 XFF。
+    # 放 server 级而非 location：real_ip 在 POST_READ 阶段执行，早于 location 匹配，
+    # 写进 location 不生效。⚠ 与同站「IP 白名单」(allow/deny 锁上游 IP) 叠加会 403——
+    # real_ip 先把 $remote_addr 改成真实访客，allow/deny 再按它比对就把访客挡了。
+    local realip_block="" _rip
+    if [ -n "$realip" ]; then
+        for _rip in $realip; do
+            realip_block+="    set_real_ip_from ${_rip};"$'\n'
+        done
+        realip_block+="    real_ip_header X-Forwarded-For;"$'\n'
+        realip_block+="    real_ip_recursive on;"$'\n'
     fi
 
     # 缓存指令块（$'' 内 nginx 变量保持字面量，\n 为真实换行）
@@ -731,6 +795,7 @@ render_site_file() {
         echo "# crt=$crt"
         echo "# key=$key"
         echo "# allow_ips=$allow_ips"
+        echo "# realip=$realip"
         echo "# ===== nginx-rp END ====="
     } > "$tmp"
 
@@ -747,7 +812,7 @@ server {
         default_type "text/plain";
     }
 
-    location / {
+$realip_block    location / {
 $access_block        proxy_pass $target;
         proxy_http_version 1.1;
         proxy_set_header Host $host_hdr;$ssl_block
@@ -798,7 +863,7 @@ server {
         default_type "text/plain";
     }
 
-    location / {
+$realip_block    location / {
 $access_block        proxy_pass $target;
         proxy_http_version 1.1;
         proxy_set_header Host $host_hdr;$ssl_block
@@ -844,10 +909,10 @@ choose_cache_mode() {
 # ----------------------------- 选择并应用 HTTPS 证书 ------------------------
 # 弹证书方式菜单并落地（渲染站点 + reload）。新建/管理换证书共用，所以「申请失败」
 # 后进管理也能改选别的方式（HTTP-01 / DNS / 本地证书 / 仅 HTTP）。
-# 用法: apply_https_cert <domain> <target> <maxbody> <cache>
+# 用法: apply_https_cert <domain> <target> <maxbody> <cache> [allow_ips] [realip]
 # 返回: 0=已写入并启用了可用站点配置（HTTP 或 HTTPS）；1=失败/取消，未写可用配置
 apply_https_cert() {
-    local domain="$1" target="$2" maxbody="$3" cache="$4" allow_ips="$5"
+    local domain="$1" target="$2" maxbody="$3" cache="$4" allow_ips="$5" realip="$6"
     echo "  请选择 HTTPS 证书方式："
     echo "    1) acme.sh 自动申请（HTTP-01，需 80 端口可达，推荐）"
     echo "    2) acme.sh 自动申请（DNS API，支持泛域名）"
@@ -856,7 +921,7 @@ apply_https_cert() {
     local s; read -rp "  输入 [1-4]（默认1）: " s
     case "$s" in
         4)
-            render_site_file "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips"
+            render_site_file "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips" "$realip"
             reload_nginx && { ok "已设为仅 HTTP：http://$domain"; return 0; }
             return 1 ;;
         3)
@@ -864,7 +929,7 @@ apply_https_cert() {
             read -rp "  证书 fullchain 路径: " crt
             read -rp "  私钥 key 路径: " key
             if [ ! -f "$crt" ] || [ ! -f "$key" ]; then err "证书文件不存在"; return 1; fi
-            render_site_file "$domain" "$target" "$maxbody" "$cache" "file" "$crt" "$key" "$allow_ips"
+            render_site_file "$domain" "$target" "$maxbody" "$cache" "file" "$crt" "$key" "$allow_ips" "$realip"
             reload_nginx && { ok "已启用（本地证书）：https://$domain"; return 0; }
             return 1 ;;
         2)
@@ -873,17 +938,17 @@ apply_https_cert() {
             local prov; case "$dp" in 1) prov=cloudflare;; 2) prov=aliyun;; 3) prov=tencent;; *) err "无效"; return 1;; esac
             if issue_cert_dns "$domain" "$prov" && install_cert_to_nginx "$domain"; then
                 render_site_file "$domain" "$target" "$maxbody" "$cache" "dns" \
-                    "$CERT_DIR/$domain/fullchain.pem" "$CERT_DIR/$domain/key.pem" "$allow_ips"
+                    "$CERT_DIR/$domain/fullchain.pem" "$CERT_DIR/$domain/key.pem" "$allow_ips" "$realip"
                 reload_nginx && { ok "已启用（HTTPS + 泛域名证书）：https://$domain"; return 0; }
             fi
             err "证书申请失败。"; return 1 ;;
         *)
             # 先建/保留 HTTP 站点承载 acme challenge，再签发，最后换成 HTTPS
-            render_site_file "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips"
+            render_site_file "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips" "$realip"
             reload_nginx || { err "初始 HTTP 配置失败"; return 1; }
             if issue_cert_http "$domain" && install_cert_to_nginx "$domain"; then
                 render_site_file "$domain" "$target" "$maxbody" "$cache" "le" \
-                    "$CERT_DIR/$domain/fullchain.pem" "$CERT_DIR/$domain/key.pem" "$allow_ips"
+                    "$CERT_DIR/$domain/fullchain.pem" "$CERT_DIR/$domain/key.pem" "$allow_ips" "$realip"
                 reload_nginx && ok "已启用（HTTPS + 自动证书）：https://$domain"
             else
                 err "证书申请失败，已保留仅 HTTP 站点。请检查域名解析 / 80 端口可达性，或改用 DNS API / 本地证书。"
@@ -907,7 +972,7 @@ configure_reverse_proxy() {
 
     choose_cache_mode
 
-    if apply_https_cert "$domain" "$target" "$maxbody" "$CACHE_MODE" ""; then created=1; fi
+    if apply_https_cert "$domain" "$target" "$maxbody" "$CACHE_MODE" "" ""; then created=1; fi
 
     # 反代建好后的两个收尾询问：
     if [ "$created" = 1 ]; then
@@ -929,19 +994,19 @@ configure_reverse_proxy() {
             read -rp "是否禁止用 IP 直接访问网站，仅允许域名访问？(y/N): " _yn2
             case "$_yn2" in y|Y) enable_deny_ip ;; esac
         fi
-        # (c) 真实客户端 IP 透传(real_ip)：本机处在另一台 nginx/CDN 之后时才需要——
-        #     从 XFF 还原真实访客 IP，后端日志/限流才不会只看到上游代理那几个 IP。
-        #     已全局开过就沿用、不再追问；未开过则默认开（直连客户端的边缘机可答 n）。
+        # (c) 真实客户端 IP 透传(real_ip)：本站处在另一台 nginx/CDN 之后时才需要——
+        #     从 XFF 还原真实访客 IP，按「本站」粒度设置（与 IP 白名单同级）。
+        #     直连客户端的边缘机无需开启，可回答 n。
         echo
         if realip_enabled; then
-            info "真实客户端 IP 透传(real_ip)已全局开启，本站沿用（改可信上游用菜单 3→5）。"
+            info "检测到【全局】real_ip 已开启（菜单 3→5），本站会沿用全局可信上游。"
+            info "想改成「仅本站」粒度：先在菜单 3→5 关闭全局，再用「管理站点」为各站单独设置。"
         else
-            echo "若这台 nginx 在另一台 nginx / CDN 之后，建议开启「真实客户端 IP 透传」："
-            echo "从 X-Forwarded-For 还原真实访客 IP，后端日志/限流才按真实访客计算。"
-            echo "（直接面向客户端的边缘机无需开启，可回答 n。）"
+            echo "若本站在另一台 nginx / CDN 之后，可为「本站」开启真实客户端 IP 透传(real_ip)："
+            echo "从 X-Forwarded-For 还原真实访客 IP（仅本站生效）。直接面向访客的边缘机无需开启。"
             local _yn3
-            read -rp "开启真实客户端 IP 透传 real_ip？(Y/n): " _yn3
-            case "$_yn3" in n|N) ;; *) enable_realip ;; esac
+            read -rp "现在为本站设置 real_ip 可信上游？(y/N): " _yn3
+            case "$_yn3" in y|Y) set_site_realip "$SITES_AVAIL/$domain.conf" ;; esac
         fi
     fi
     pause
@@ -1055,36 +1120,38 @@ manage_reverse_proxy() {
 # 本脚本托管站点的详情管理（原 manage_reverse_proxy 主体）
 manage_managed_site() {
     local f="$1"
-    local domain target maxbody cache ssl crt key allow_ips
+    local domain target maxbody cache ssl crt key allow_ips realip
     domain=$(get_meta domain "$f"); target=$(get_meta target "$f")
     maxbody=$(get_meta maxbody "$f"); cache=$(get_meta cache "$f")
     ssl=$(get_meta ssl "$f"); crt=$(get_meta crt "$f"); key=$(get_meta key "$f")
-    allow_ips=$(get_meta allow_ips "$f")
+    allow_ips=$(get_meta allow_ips "$f"); realip=$(get_meta realip "$f")
 
     echo "  当前： $domain -> $target  [缓存:$cache 证书:$ssl 上限:${maxbody}m]"
     echo "         IP 白名单：${allow_ips:-未设置（任意 IP 可访问）}"
+    echo "         真实IP透传：${realip:-未设置}（real_ip 可信上游）"
     echo "    1) 修改反代目标"
     echo "    2) 修改缓存模式"
     echo "    3) 申请/更换 HTTPS 证书（HTTP-01 / DNS / 本地证书 / 仅 HTTP）"
     echo "    4) 删除该站点"
     echo "    5) 设置 IP 访问白名单（仅允许指定 IP 访问，回源域名用）"
+    echo "    6) 设置真实客户端 IP 透传 real_ip（本站从 XFF 还原真实访客 IP）"
     echo "    0) 返回"
     local op; read -rp "  选择: " op
     case "$op" in
         1)
             read -rp "  新目标: " target
             [ -z "$target" ] && { err "不能为空"; pause; return; }
-            render_site_file "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$allow_ips"
+            render_site_file "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$realip"
             reload_nginx && ok "目标已更新"
             ;;
         2)
             choose_cache_mode
-            render_site_file "$domain" "$target" "$maxbody" "$CACHE_MODE" "$ssl" "$crt" "$key" "$allow_ips"
+            render_site_file "$domain" "$target" "$maxbody" "$CACHE_MODE" "$ssl" "$crt" "$key" "$allow_ips" "$realip"
             reload_nginx && ok "缓存模式已改为 $CACHE_MODE"
             ;;
         3)
             ensure_global_conf
-            apply_https_cert "$domain" "$target" "$maxbody" "$cache" "$allow_ips"
+            apply_https_cert "$domain" "$target" "$maxbody" "$cache" "$allow_ips" "$realip"
             ;;
         4)
             read -rp "  确认删除 $domain ？(y/N): " yn
@@ -1106,15 +1173,18 @@ manage_managed_site() {
             if [ "$bad" = 1 ]; then
                 err "含非法字符，IP/网段只能包含数字、字母(IPv6)、. : / ，已取消。"
             else
-                render_site_file "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$newips"
+                render_site_file "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$newips" "$realip"
                 if reload_nginx; then
-                    if [ -n "$newips" ]; then ok "已设置白名单，仅允许：$newips（其它来源 403）"
+                    if [ -n "$newips" ]; then
+                        ok "已设置白名单，仅允许：$newips（其它来源 403）"
+                        [ -n "$realip" ] && warn "本站同时开着 real_ip（$realip）：real_ip 会把 \$remote_addr 改成真实访客，白名单将按真实访客比对——若这是「锁上游 IP」用途会 403，请改用安全组/iptables。"
                     else ok "已清除白名单，恢复任意 IP 可访问。"; fi
                 else
                     err "配置测试失败，请检查输入的 IP 是否合法（可重新设置或清空）。"
                 fi
             fi
             ;;
+        6) set_site_realip "$f" ;;
         *) return ;;
     esac
     pause
@@ -1190,7 +1260,7 @@ import_external_site() {
         return
     fi
 
-    local domain target maxbody ssl crt key allow_ips body was_enabled
+    local domain target maxbody ssl crt key allow_ips realip body was_enabled
     body=$(_nocomment "$real")
     domain=$(_first_server_name "$real"); target=$(_first_proxy_pass "$real")
     [ -z "$domain" ] && { err "解析不到 server_name，无法导入。"; return; }
@@ -1206,6 +1276,8 @@ import_external_site() {
     if [ -n "$crt" ] && [ -n "$key" ]; then ssl=file; else ssl=none; crt=""; key=""; fi
     allow_ips=$(echo "$body" | grep -oE 'allow[[:space:]]+[^;]+' | sed -E 's/allow[[:space:]]+//' | sort -u | tr '\n' ' ')
     local -a _ai; read -ra _ai <<< "$allow_ips"; allow_ips="${_ai[*]}"
+    realip=$(echo "$body" | grep -oE 'set_real_ip_from[[:space:]]+[^;]+' | sed -E 's/set_real_ip_from[[:space:]]+//' | sort -u | tr '\n' ' ')
+    local -a _ri; read -ra _ri <<< "$realip"; realip="${_ri[*]}"
 
     echo "  解析结果（导入后按本脚本模板重写）："
     echo "    域名     : $domain"
@@ -1214,6 +1286,7 @@ import_external_site() {
     echo "    证书     : $ssl${crt:+（$crt）}"
     echo "    缓存     : none（导入后可在受管菜单调整）"
     echo "    IP白名单 : ${allow_ips:-（无）}"
+    echo "    真实IP上游: ${realip:-（无）}"
     warn "导入会用模板重写该站点，原文件的自定义指令将丢失（会先自动备份）。"
     local yn; read -rp "  确认导入接管？(y/N): " yn
     [ "$yn" = "y" ] || [ "$yn" = "Y" ] || { info "已取消"; return; }
@@ -1225,7 +1298,7 @@ import_external_site() {
     ensure_sites_enabled_include
     ensure_global_conf
     local managed="$SITES_AVAIL/$domain.conf"
-    render_site_file "$domain" "$target" "$maxbody" "none" "$ssl" "$crt" "$key" "$allow_ips"
+    render_site_file "$domain" "$target" "$maxbody" "none" "$ssl" "$crt" "$key" "$allow_ips" "$realip"
 
     # 原文件 ≠ 受管文件 → 停用原文件，避免 server_name 重复冲突
     local disabled_old="" e
