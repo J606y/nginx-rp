@@ -607,6 +607,26 @@ EOF
     ok "公共配置已写入 $GLOBAL_CONF"
 }
 
+# 清理某站点在共用反代缓存(rpcache)里的条目。缓存文件头部含一行 "KEY: $scheme$host$request_uri"，
+# 按该站点的每个 server_name(host) 精确匹配后删除——rpcache 是多站点共用的，不能整目录删，
+# 只能逐条挑。host 里的点做转义，避免正则把别的域名一起误删。
+# $1 = 该站点的全部域名（空格分隔，即 meta 的 domain）。
+purge_site_cache() {
+    local domains="$1" host host_re n=0 file
+    [ -d "$CACHE_DIR" ] || return 0
+    command -v grep >/dev/null 2>&1 || return 0
+    info "清理该站点缓存条目（遍历缓存目录，文件多时可能稍慢）..."
+    for host in $domains; do
+        host_re="${host//./\\.}"                     # example.com -> example\.com
+        # KEY 形如 httpexample.com/...　或　httpsexample.com/...（scheme 直接接 host 接 /路径）
+        while IFS= read -r file; do
+            [ -n "$file" ] && rm -f "$file" && n=$((n+1))
+        done < <(grep -rlsE "KEY: https?${host_re}/" "$CACHE_DIR" 2>/dev/null)
+    done
+    if [ "$n" -gt 0 ]; then ok "已清理该站点缓存条目 $n 个"
+    else info "该站点无缓存条目（未开缓存或缓存已空）"; fi
+}
+
 # 确保 nginx.conf 引入 sites-enabled（部分精简/第三方安装默认只用 conf.d）。
 # 安装、以及把外部反代导入为受管站点（落在 sites-available + sites-enabled 软链）时都要先确保它，
 # 否则受管站点不会被加载、而 nginx -t 仍通过 → reload「假成功」但站点其实没生效。
@@ -1359,6 +1379,13 @@ manage_managed_site() {
                     rm -f "$f" "$SITES_ENABLED/$primary.conf"
                     if [ -n "$bak" ]; then restart_nginx && ok "站点已删除（备份在 $bak）"
                     else                   restart_nginx && ok "站点已删除（未备份）"; fi
+                    # 清理该站点的运行产物（缓存条目 + 访问日志及其轮转），做到「像没配置过一样」。
+                    # 备份(若选了)仍保留在 BACKUP_DIR，证书在下方单独询问。
+                    purge_site_cache "$domain"
+                    local _alog="/var/log/nginx/${primary}_access.log"
+                    if [ -e "$_alog" ] || ls "$_alog."* >/dev/null 2>&1; then
+                        rm -f "$_alog" "$_alog."* 2>/dev/null && info "已删除该站点访问日志（$_alog*）"
+                    fi
                     # 删站后追问：是否连带删除该域名的证书并停止自动续签。
                     # 仅处理本脚本签发、存放于 $CERT_DIR/$primary 的证书；本地证书/纯 HTTP 不涉及。
                     if [ -d "$CERT_DIR/$primary" ]; then
