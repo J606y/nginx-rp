@@ -354,7 +354,7 @@ enable_deny_ip() {
         fi
     } > "$DENY_IP_CONF"
 
-    if reload_nginx; then
+    if restart_nginx; then
         ok "已开启：用 IP 直接访问将被拒绝，只有域名能打开。"
     else
         err "配置测试失败，已回滚（可能与已有 default_server 冲突）。"
@@ -366,7 +366,7 @@ enable_deny_ip() {
 disable_deny_ip() {
     [ -f "$DENY_IP_CONF" ] || { info "未开启「禁止 IP 直连」"; return 0; }
     rm -f "$DENY_IP_CONF"
-    reload_nginx && ok "已关闭「禁止 IP 直连」（IP 访问恢复默认行为）。"
+    restart_nginx && ok "已关闭「禁止 IP 直连」（IP 访问恢复默认行为）。"
 }
 
 # ------------------- 真实客户端 IP 透传（real_ip） --------------------------
@@ -421,7 +421,7 @@ enable_realip() {
         echo "real_ip_recursive on;"
     } > "$REALIP_CONF"
 
-    if reload_nginx; then
+    if restart_nginx; then
         ok "已开启 real_ip：本机日志与限流将按真实客户端 IP（X-Forwarded-For）计算。"
         # real_ip 在 POST_READ 阶段就改写 $remote_addr，早于 allow/deny 与 limit_req。
         warn "注意：本脚本的「IP 访问白名单」靠 allow/deny 按来源 IP 判断，开了 real_ip 后它会"
@@ -436,7 +436,7 @@ enable_realip() {
 disable_realip() {
     [ -f "$REALIP_CONF" ] || { info "未开启 real_ip"; return 0; }
     rm -f "$REALIP_CONF"
-    reload_nginx && ok "已关闭 real_ip（恢复使用直连对端 IP）。"
+    restart_nginx && ok "已关闭 real_ip（恢复使用直连对端 IP）。"
 }
 
 realip_menu() {
@@ -507,6 +507,7 @@ set_site_realip() {
     if render_site_safe "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$froms"; then
         if [ -n "$froms" ]; then ok "已为 $domain 开启 real_ip，可信上游：$froms"
         else ok "已关闭 $domain 的 real_ip（恢复使用直连对端 IP）。"; fi
+        restart_nginx   # 安全类变更：彻底重启清掉残留旧 worker，避免旧访问规则继续生效
     else
         return 1
     fi
@@ -541,9 +542,27 @@ set_site_allow_ips() {
             ok "已设置白名单，仅允许：$newips（其它来源 403）"
             [ -n "$realip" ] && warn "本站同时开着 real_ip（$realip）：real_ip 会把 \$remote_addr 改成真实访客，白名单将按真实访客比对——若这是「锁上游 IP」用途会 403，请改用安全组/iptables。"
         else ok "已清除白名单，恢复任意 IP 可访问。"; fi
+        restart_nginx   # 安全类变更：彻底重启清掉残留旧 worker，避免旧访问规则继续生效
         return 0
     fi
     return 1
+}
+
+# 在 nginx.conf 的 main 上下文确保 worker_shutdown_timeout（幂等，不覆盖用户已设的值）。
+# 作用：reload 时旧 worker 最多再存活该时长就被强制收掉，避免长连接(视频流/keepalive)
+# 让旧配置长期残留——这正是「改了配置但旧连接仍走旧规则」的根因。注意它属于 main 上下文，
+# 不能放 conf.d（那是 http 内），所以必须改主配置文件。
+ensure_worker_shutdown_timeout() {
+    local conf=/etc/nginx/nginx.conf to="30s"
+    [ -f "$conf" ] || return 0
+    grep -qE '^[[:space:]]*worker_shutdown_timeout' "$conf" && return 0
+    if grep -qE '^[[:space:]]*events[[:space:]]*\{' "$conf"; then
+        # 插到第一个 events{ 之前（main 上下文）
+        sed -i "0,/^[[:space:]]*events[[:space:]]*{/s//worker_shutdown_timeout $to;  # 由 nginx-rp.sh 添加：限制 reload 后旧 worker 存活上限，避免旧配置残留\n&/" "$conf"
+        warn "已在 nginx.conf 设置 worker_shutdown_timeout $to（reload 后旧配置最多 $to 收敛）"
+    else
+        warn "nginx.conf 未找到 events 块，跳过 worker_shutdown_timeout 设置。"
+    fi
 }
 
 # ----------------------------- 全局配置 -------------------------------------
@@ -584,6 +603,7 @@ map $upstream_http_content_type $rp_skip_media {
     ~*dash\+xml                1;
 }
 EOF
+    ensure_worker_shutdown_timeout
     ok "公共配置已写入 $GLOBAL_CONF"
 }
 
@@ -1337,8 +1357,8 @@ manage_managed_site() {
                     local bak="" b; read -rp "  删除前先备份站点配置？(Y/n): " b
                     case "$b" in n|N) : ;; *) bak=$(backup_file "$f") ;; esac
                     rm -f "$f" "$SITES_ENABLED/$primary.conf"
-                    if [ -n "$bak" ]; then reload_nginx && ok "站点已删除（备份在 $bak）"
-                    else                   reload_nginx && ok "站点已删除（未备份）"; fi
+                    if [ -n "$bak" ]; then restart_nginx && ok "站点已删除（备份在 $bak）"
+                    else                   restart_nginx && ok "站点已删除（未备份）"; fi
                     # 删站后追问：是否连带删除该域名的证书并停止自动续签。
                     # 仅处理本脚本签发、存放于 $CERT_DIR/$primary 的证书；本地证书/纯 HTTP 不涉及。
                     if [ -d "$CERT_DIR/$primary" ]; then
@@ -1566,8 +1586,9 @@ cert_menu() {
         echo "    2) 立即续签全部（强制）"
         echo "    3) 续签指定域名"
         echo "    4) 查看自动续签计划（cron）"
+        echo "    5) 删除指定证书并停止续签"
         echo "    0) 返回"
-        local op; read -rp "  请选择 [0-4]: " op
+        local op; read -rp "  请选择 [0-5]: " op
         case "$op" in
             1) "$ACME" --list ;;
             2) "$ACME" --cron --force; ok "已触发强制续签" ;;
@@ -1580,6 +1601,33 @@ cert_menu() {
                 else
                     warn "未发现 acme.sh 续签 cron。请重新申请一次证书以触发安装/修复。"
                 fi
+                ;;
+            5)
+                "$ACME" --list
+                local d; read -rp "  要删除证书的域名（主域名，见上方列表）: " d
+                [ -z "$d" ] && { warn "未输入域名，已取消。"; pause; continue; }
+                # 在用检查：若仍有受管站点 ssl_certificate 指向该证书目录，删文件后这些站点
+                # 下次 nginx -t 会因证书缺失失败、reload 崩。先列出并要求二次确认。
+                local inuse="" _cf
+                for _cf in $(grep -lF "$CERT_DIR/$d/" "$SITES_AVAIL"/*.conf 2>/dev/null); do
+                    inuse+="$(basename "$_cf") "
+                done
+                if [ -n "$inuse" ]; then
+                    err "以下站点仍在使用该证书：$inuse"
+                    warn "删除后它们会因证书文件缺失导致 nginx 测试失败。请先给这些站点换证书或改为仅 HTTP。"
+                    local force; read -rp "  仍要删除？(y/N): " force
+                    case "$force" in y|Y) : ;; *) info "已取消。"; pause; continue ;; esac
+                fi
+                local yn; read -rp "  确认删除 $d 的证书并停止自动续签？(y/N): " yn
+                case "$yn" in
+                    y|Y)
+                        "$ACME" --remove -d "$d" --ecc >/dev/null 2>&1
+                        rm -rf "$CERT_DIR/$d"
+                        ok "已删除 $d 的证书并从 acme.sh 移除续签登记。"
+                        [ -n "$inuse" ] && warn "记得尽快给仍引用它的站点（$inuse）换证书，否则下次 reload/restart 会失败。"
+                        ;;
+                    *) info "已取消。" ;;
+                esac
                 ;;
             0) return ;;
             *) warn "无效选项"; sleep 1; continue ;;
