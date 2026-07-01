@@ -796,15 +796,50 @@ ensure_acme() {
 }
 
 # ----------------------------- 证书签发 -------------------------------------
+# 签发前清理该域名在 acme.sh 里的残留工作目录（上次中断/旧签发留下的域名私钥、cer、conf）。
+# acme.sh 把 --issue 当「非续签的全新签发」，若 ~/.acme.sh/<主域名>_ecc/ 已存在旧域名私钥，
+# 会报 "Domain key exists ... add '--force'" 直接中止；HTTP-01 与 DNS 共用同一份私钥，故两条
+# 路都被卡。签发前先删掉残留即可干净重签。注意：只清 acme.sh 内部目录，不动已装到 nginx 的
+# 证书($CERT_DIR)。ec-256 用 <主域名>_ecc；顺带清可能存在的非 ecc 目录。
+purge_acme_residual() {
+    local primary="${1%% *}" d               # 主域名（第一个 -d），acme.sh 以它命名目录
+    [ -n "$primary" ] || return 0
+    for d in "$ACME_HOME/${primary}_ecc" "$ACME_HOME/${primary}"; do
+        if [ -d "$d" ]; then
+            rm -rf "$d"
+            warn "已清理 acme.sh 残留目录 $d（旧 key/配置），将干净重新签发"
+        fi
+    done
+}
+
+# 统一的 acme.sh 签发入口：附带公共参数(ec-256 / letsencrypt)。
+# 正常情况下调用方已先 purge_acme_residual 清掉残留私钥；这里再兜底：万一仍因残留 key 报
+# "Domain key exists ... add '--force'"（如残留在预期外的路径），捕获该特定错误后自动带
+# --force 重试一次覆盖，其它错误照常返回，不无脑 --force（避免有效证书被无谓重签、触碰 LE 限额）。
+acme_issue() {
+    local log rc
+    log="$(mktemp 2>/dev/null || echo "/tmp/acme_issue.$$")"
+    "$ACME" --issue "$@" --keylength ec-256 --server letsencrypt 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    if [ "$rc" -ne 0 ] && grep -q "Domain key exists" "$log"; then
+        warn "检测到上次中断残留的域名私钥，带 --force 覆盖重新签发..."
+        "$ACME" --issue "$@" --keylength ec-256 --server letsencrypt --force
+        rc=$?
+    fi
+    rm -f "$log"
+    return "$rc"
+}
+
 # 通过 webroot(HTTP-01) 签发；要求该域名已 A 记录指向本机且 80 端口可达，
 # 且本机已存在监听该域名 80 端口、serving /var/www/acme 的 server（add_site 会先建）。
 issue_cert_http() {
     local domain="$1"
     ensure_acme || return 1
+    purge_acme_residual "$domain"                 # 清掉上次残留，避免 "Domain key exists"
     local -a dargs=(); local d
     for d in $domain; do dargs+=(-d "$d"); done   # 多域名 → 多个 -d（SAN 证书）
     info "通过 HTTP-01(webroot) 为 $domain 申请证书..."
-    "$ACME" --issue "${dargs[@]}" --webroot "$ACME_WEBROOT" --keylength ec-256 --server letsencrypt
+    acme_issue "${dargs[@]}" --webroot "$ACME_WEBROOT"
 }
 
 # 通过 DNS API 签发（支持泛域名 *.domain）
@@ -827,13 +862,14 @@ issue_cert_dns() {
             export DP_Id DP_Key; dnsapi="dns_dp" ;;
         *) err "未知 DNS 服务商"; return 1 ;;
     esac
+    purge_acme_residual "$domain"                 # 清掉上次残留，避免 "Domain key exists"
     local -a dargs=(); local d
     for d in $domain; do dargs+=(-d "$d"); done
     # 仅单域名时附带签发泛域名 *.domain；多域名时按所给列表逐个签，不自动加泛域名。
     local -a _w; read -ra _w <<< "$domain"; local extra=""
     if [ "${#_w[@]}" -eq 1 ]; then dargs+=(-d "*.$domain"); extra=" 及 *.$domain"; fi
     info "通过 DNS API($dnsapi) 为 $domain$extra 申请证书..."
-    "$ACME" --issue --dns "$dnsapi" "${dargs[@]}" --keylength ec-256 --server letsencrypt
+    acme_issue --dns "$dnsapi" "${dargs[@]}"
 }
 
 # 把已签发证书安装到 nginx 目录，并登记 reloadcmd（续签后自动 reload）
