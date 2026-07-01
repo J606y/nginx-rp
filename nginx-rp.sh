@@ -565,6 +565,19 @@ ensure_worker_shutdown_timeout() {
     fi
 }
 
+# 发行版默认 nginx.conf 的 http{} 里通常已带 gzip on;（部分还含其它 gzip_*）。
+# 本脚本的公共配置 conf.d/00-nginx-rp.conf 也在 http{} 内声明 gzip，两者同上下文重复，
+# 会让 nginx -t 报 "gzip directive is duplicate"。这里把 nginx.conf 里未注释的
+# gzip / gzip_* 行注释掉，让 conf.d 成为唯一来源（幂等：已注释的行不再处理）。
+neutralize_conf_gzip() {
+    local conf=/etc/nginx/nginx.conf
+    [ -f "$conf" ] || return 0
+    # 行首（允许前导空白）紧跟 gzip 或 gzip_ 且未被 # 注释的行才处理
+    grep -qE '^[[:space:]]*gzip([[:space:]_])' "$conf" || return 0
+    sed -i -E 's/^([[:space:]]*)(gzip([[:space:]_]).*)$/\1# \2  # 由 nginx-rp.sh 注释：gzip 统一在 conf.d\/00-nginx-rp.conf 管理/' "$conf"
+    warn "已注释 nginx.conf 内默认的 gzip 设置（改由 $GLOBAL_CONF 统一管理，避免重复声明）"
+}
+
 # ----------------------------- 全局配置 -------------------------------------
 # 写入 http 上下文的公共配置：缓存区、websocket upgrade map、媒体类型跳过缓存 map
 ensure_global_conf() {
@@ -604,6 +617,7 @@ map $upstream_http_content_type $rp_skip_media {
 }
 EOF
     ensure_worker_shutdown_timeout
+    neutralize_conf_gzip   # 消除 nginx.conf 默认 gzip 与本文件的重复声明
     ok "公共配置已写入 $GLOBAL_CONF"
 }
 
