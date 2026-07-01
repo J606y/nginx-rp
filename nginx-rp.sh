@@ -1359,8 +1359,8 @@ manage_reverse_proxy() {
         c_green "===== 本机反向代理站点 ====="
         echo "（本脚本托管 + 外部发现，可改配置 / 启停 / 导入接管）"
         list_all_proxies || { pause; return; }
-        local idx; read -rp "选择要管理的站点序号（回车返回）: " idx
-        [ -z "$idx" ] && return
+        local idx; read -rp "选择要管理的站点序号（0 返回）: " idx
+        { [ -z "$idx" ] || [ "$idx" = "0" ]; } && return   # 0/空回车均返回，与各菜单统一
         case "$idx" in *[!0-9]*) err "无效序号"; pause; continue ;; esac
         local n=$((10#$idx - 1))   # 10# 强制十进制，避免 08/09 被当八进制报错
         { [ "$n" -lt 0 ] || [ "$n" -ge "${#SITE_FILES[@]}" ]; } && { err "无效序号"; pause; continue; }
@@ -1757,8 +1757,8 @@ port_block_menu() {
         | grep -oE '(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):[0-9]+' \
         | grep -oE ':[0-9]+' | tr -d ':' | sort -un | tr '\n' ' ')
     [ -n "$hints" ] && echo "  检测到本机反代后端端口：$hints"
-    local port; read -rp "  输入后端端口（如 8080，回车返回）: " port
-    [ -z "$port" ] && return
+    local port; read -rp "  输入后端端口（如 8080，0 返回）: " port
+    { [ -z "$port" ] || [ "$port" = "0" ]; } && return   # 0/空回车均返回，与各菜单统一
     case "$port" in *[!0-9]*) err "端口需为数字"; pause; return ;; esac
     if backend_port_blocked "$port"; then
         warn "端口 $port 当前【已封锁】公网直连"
