@@ -17,6 +17,11 @@
 - **安全收紧**：
   - 禁止用 IP / 未知域名直接访问（default_server 兜底，HTTP 444、HTTPS `ssl_reject_handshake`，老版本回落自签证书）。
   - 封锁后端端口公网直连（iptables，同时处理 `DOCKER-USER` 链，保留本机回环给 Nginx）。
+  - 按站点 IP 访问白名单（allow/deny）：回源域名只放行边缘节点 IP，其余一律拒绝。
+- **真实客户端 IP 透传（real_ip）**：多台 nginx 串/并联或 CDN 回源时，从 `X-Forwarded-For` 还原真实访客 IP；支持全局开关与按站点设置（与 IP 白名单同粒度）。
+- **接管本机所有反代**：自动发现非本脚本创建的 nginx 反代配置，支持启停、删除（可选备份）与导入接管，接管后享受同等管理能力。
+- **站点全生命周期管理**：改反代目标 / 缓存档位 / 上传上限（`client_max_body_size`）/ 换证书；删除站点时连带清理缓存条目与访问日志，并可选删除证书、停止续签。
+- **运维入口**：nginx 运行状态、`nginx -t`、reload / restart、错误与访问日志速览。
 - **快捷命令 `n`**：首次运行后安装到 `/usr/local/bin`，以后任意目录输入 `n` 即可打开菜单（非 root 自动 `sudo` 提权）。
 - **脚本自更新**：菜单「更新本脚本」从 GitHub 拉最新版（优先 API 端点避开 CDN 缓存，失败回退 raw），语法校验通过才覆盖。
 
@@ -53,15 +58,19 @@ n
 ## 菜单一览
 
 ```
-1. 安装 Nginx
-2. 配置反向代理
-3. 管理反向代理
-   ├─ 管理已配置站点（改目标 / 改缓存 / 换证书 / 删除）
-   ├─ 证书 / 自动续签管理
+1. 配置反向代理（新建站点）
+2. 管理反向代理
+   ├─ 管理已配置站点（托管 + 外部发现：改目标 / 缓存 / 上传上限 / 证书 /
+   │   IP 白名单 / real_ip / 删除；外部配置可启停、导入接管）
+   ├─ 证书 / 自动续签管理（列表 / 强制续签 / 删除证书并停止续签）
    ├─ 后端端口直连封锁（开 / 关）
-   └─ 禁止用 IP 直接访问（开 / 关，仅域名可访问）
-4. 卸载 Nginx
+   ├─ 禁止用 IP 直接访问（开 / 关，仅域名可访问）
+   ├─ 真实客户端 IP 透传 real_ip（全局开关）
+   └─ 运行状态 / 日志 / 手动 reload · restart
+3. 安装 Nginx
+4. 更新 Nginx 程序
 5. 更新本脚本（拉 GitHub 最新）
+9. 卸载 Nginx（危险）
 0. 退出
 ```
 
@@ -72,6 +81,8 @@ n
 | `/etc/nginx/sites-available/<域名>.conf` | 各站点配置（含本脚本元信息注释，用于回读管理） |
 | `/etc/nginx/conf.d/00-nginx-rp.conf` | 公共配置：缓存区、WebSocket map、媒体跳过缓存 map |
 | `/etc/nginx/conf.d/00-deny-direct-ip.conf` | 「禁止 IP 直连」兜底 server（开启后存在） |
+| `/etc/nginx/conf.d/00-nginx-rp-realip.conf` | real_ip 全局可信上游配置（开启后存在） |
+| `/etc/nginx/nginx-rp-backups/` | 导入 / 删除站点配置前的备份 |
 | `/etc/nginx/certs/<域名>/` | 安装到 Nginx 的证书（fullchain.pem / key.pem） |
 | `/var/cache/nginx/nginx_rp` | 反代缓存目录 |
 | `~/.acme.sh/` | acme.sh 与自动续签 cron |
