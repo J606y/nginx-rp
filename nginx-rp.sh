@@ -156,6 +156,7 @@ self_update() {
 # ③ 当前没运行。不依赖 /run/nginx.pid（野进程常常没写它，导致 nginx -s reload
 # 报 invalid PID），而是直接定位正在运行的 master 进程发 HUP 重载（零停机）。
 reload_nginx() {
+    neutralize_conf_gzip   # 每次 reload 前兜底：清掉 nginx.conf 默认 gzip，防止与公共配置重复声明
     if ! nginx -t 2>/tmp/nginx_test.log; then
         err "Nginx 配置测试失败，未重载。错误如下："
         cat /tmp/nginx_test.log
@@ -193,6 +194,7 @@ reload_nginx() {
 # worker 可能赖着不退继续用旧配置服务。systemctl restart 会把整个服务进程组换新，连僵尸
 # worker 一起清掉。非 systemd 环境回退到 stop + 清残留 + start。
 restart_nginx() {
+    neutralize_conf_gzip   # 同 reload：重启前兜底清掉 nginx.conf 默认 gzip，避免重复声明
     if ! nginx -t 2>/tmp/nginx_test.log; then
         err "Nginx 配置测试失败，未重启。错误如下："; cat /tmp/nginx_test.log; return 1
     fi
@@ -1804,7 +1806,7 @@ ops_menu() {
         case "$op" in
             1) systemctl status nginx --no-pager 2>/dev/null \
                  || { echo "nginx 进程："; pgrep -ax nginx || echo "（未在运行）"; } ;;
-            2) nginx -t ;;
+            2) neutralize_conf_gzip; nginx -t ;;   # 与 reload 一致：先兜底再测，免得误报 gzip 重复
             3) reload_nginx ;;
             4) local yn; read -rp "  重启会中断所有连接，确认？(y/N): " yn
                case "$yn" in y|Y) restart_nginx ;; *) info "已取消" ;; esac ;;
