@@ -7,18 +7,24 @@
 ## 功能
 
 - **安装 Nginx**：自动补 `nginx.conf` 对 `sites-enabled` 的 include、放行 80/443 防火墙（ufw / firewalld / iptables 自适应）；已有 Nginx（含 Docker / 手动启动）不重复安装、不抢端口，只平滑重载。
-- **配置反向代理**：按域名生成站点配置，支持 `http://127.0.0.1:8080` 本机后端，也支持 `https://源站域名` 回源（自动补 SNI 与源站 Host，避免串站）。
+- **配置反向代理**：按域名生成站点配置，支持 `http://127.0.0.1:8080` 本机后端，也支持 `https://源站域名` 回源（自动补 SNI 与源站 Host，避免串站；源站是公网可信证书时可选开启 `proxy_ssl_verify` 校验，防回源链路被中间人）。
 - **自动 HTTPS 证书**（acme.sh，默认 Let's Encrypt）：
   - HTTP-01（webroot，需 80 可达）
   - DNS API（Cloudflare / 阿里云 / 腾讯云 DNSPod，支持泛域名 `*.domain`）
   - 使用已有本地证书文件
   - 签发即托管自动续签（内置 cron，续签后自动 reload）
-- **三种缓存档位**：无缓存（纯流媒体/上传，关闭缓冲）、普通缓存（网页/静态，Range 与视频自动绕过）、视频分片缓存（slice 切片缓存 Range 响应）。
+- **五种缓存档位**：
+  - **无缓存**：纯透传并关闭缓冲，适合流媒体 / 上传 / WebSocket / API。
+  - **静态缓存**：只缓 css / js / 图片 / 字体等静态后缀，动态请求全透传——带登录/个性化的动态网站选这档，加速静态且绝不碰用户数据。
+  - **普通缓存**：整站可缓（尊重源站 `Cache-Control`），适合纯公开内容站；带 `Authorization` 头或会话 cookie 的请求自动绕过（nginx 原生缓存**不看**这两样，不绕过会把私有响应按 URL 串给其他用户）；支持按站点自填登录 cookie 名/正则（会话 cookie 名特殊、或框架给匿名访客也发会话 cookie 时用）。
+  - **微缓存**：匿名动态页强缓 5–600 秒（默认 60，忽略源站 `no-store`——Next/Nuxt 等框架的动态 SSR 页默认全发 no-store，普通档永远缓不上 HTML），登录态照常绕过、Next 的 RSC 导航请求自动绕过；小机器扛并发的利器：几十个并发打同一页只回源渲染 1 次。源站可对个别路径发 `X-Accel-Expires: 0` 拒缓（逃生阀）。**登录 cookie 务必配准，识别不到 = 串号。**
+  - **视频分片缓存**：slice 按 1MB 切片缓存 Range 响应，同样带登录态绕过防私有视频串号。
+  - 缓存档位均附带：并发回源合并（`proxy_cache_lock`，防击穿）、源站故障时先吐旧缓存（`use_stale` + 后台静默刷新）、304 廉价续期（`revalidate`）、`X-Cache-Status` 命中率调试头；WebSocket 握手（Upgrade）自动绕过缓存，WS 与缓存共存不打架。
 - **安全收紧**：
   - 禁止用 IP / 未知域名直接访问（default_server 兜底，HTTP 444、HTTPS `ssl_reject_handshake`，老版本回落自签证书）。
   - 封锁后端端口公网直连（iptables，同时处理 `DOCKER-USER` 链，保留本机回环给 Nginx）。
-  - 按站点 IP 访问白名单（allow/deny）：回源域名只放行边缘节点 IP，其余一律拒绝。
-- **真实客户端 IP 透传（real_ip）**：多台 nginx 串/并联或 CDN 回源时，从 `X-Forwarded-For` 还原真实访客 IP；支持全局开关与按站点设置（与 IP 白名单同粒度）。
+  - 按站点 IP 访问白名单：回源域名只放行边缘节点 IP，其余一律 403。按「直连对端 IP」（`$realip_remote_addr`）geo 判定，**与 real_ip 同站共存不冲突**——锁上游 + 后端拿真实访客 IP 两不误。
+- **真实客户端 IP 透传（real_ip）**：多台 nginx 串/并联或 CDN 回源时，从 `X-Forwarded-For` 还原真实访客 IP，后端日志/限流按真实访客计算（不开的话后端只能看到边缘 nginx 的 IP）；支持全局开关与按站点设置。
 - **接管本机所有反代**：自动发现非本脚本创建的 nginx 反代配置，支持启停、删除（可选备份）与导入接管，接管后享受同等管理能力。
 - **站点全生命周期管理**：改反代目标 / 缓存档位 / 上传上限（`client_max_body_size`）/ 换证书；删除站点时连带清理缓存条目与访问日志，并可选删除证书、停止续签。
 - **运维入口**：nginx 运行状态、`nginx -t`、reload / restart、错误与访问日志速览。
@@ -79,7 +85,7 @@ n
 | 路径 | 说明 |
 | --- | --- |
 | `/etc/nginx/sites-available/<域名>.conf` | 各站点配置（含本脚本元信息注释，用于回读管理） |
-| `/etc/nginx/conf.d/00-nginx-rp.conf` | 公共配置：缓存区、WebSocket map、媒体跳过缓存 map |
+| `/etc/nginx/conf.d/00-nginx-rp.conf` | 公共配置：缓存区、WebSocket map、媒体/登录态/静态后缀判定 map |
 | `/etc/nginx/conf.d/00-deny-direct-ip.conf` | 「禁止 IP 直连」兜底 server（开启后存在） |
 | `/etc/nginx/conf.d/00-nginx-rp-realip.conf` | real_ip 全局可信上游配置（开启后存在） |
 | `/etc/nginx/nginx-rp-backups/` | 导入 / 删除站点配置前的备份 |

@@ -5,7 +5,8 @@
 #  主要功能：
 #    - acme.sh 自动申请证书（HTTP-01 webroot / DNS API 泛域名）
 #    - acme.sh 自动续签（内置 cron，签发即托管，附续签管理菜单）
-#    - 针对不同站点的 Nginx 缓存开关（无缓存 / 普通缓存 / 视频分片缓存）
+#    - 针对不同站点的 Nginx 缓存档位（无缓存 / 静态缓存 / 普通缓存 / 微缓存 / 视频分片缓存），
+#      缓存档自动绕过登录态（Authorization 头 + 会话 cookie），防止私有响应串号
 #
 #  目标环境：Debian / Ubuntu + 系统 nginx（apt / systemd），nginx >= 1.25
 #  适用场景：边缘 nginx 反代到源站（如某后端 origin:8080 视频流）
@@ -425,9 +426,10 @@ enable_realip() {
 
     if restart_nginx; then
         ok "已开启 real_ip：本机日志与限流将按真实客户端 IP（X-Forwarded-For）计算。"
-        # real_ip 在 POST_READ 阶段就改写 $remote_addr，早于 allow/deny 与 limit_req。
-        warn "注意：本脚本的「IP 访问白名单」靠 allow/deny 按来源 IP 判断，开了 real_ip 后它会"
-        warn "      改用真实访客 IP 比对——“只放行边缘 IP”请改用防火墙/安全组，勿与 real_ip 同机叠加。"
+        # 新版站点白名单按 $realip_remote_addr(真实对端)geo 判定,与 real_ip 天然共存;
+        # 但旧版脚本渲染的站点仍是 allow/deny(按被改写后的 $remote_addr 比对)→ 会 403。
+        warn "注意：旧版本渲染过的「IP 白名单」站点需重新保存一次才与 real_ip 兼容"
+        warn "     （管理站点 → 5 重设一遍白名单即可，新版按直连对端 IP 判定）。"
     else
         err "配置测试失败，已回滚。"
         rm -f "$REALIP_CONF"; reload_nginx
@@ -472,11 +474,12 @@ realip_menu() {
 set_site_realip() {
     local f="$1"
     [ -f "$f" ] || { err "站点文件不存在：$f"; return 1; }
-    local domain target maxbody cache ssl crt key allow_ips realip
+    local domain target maxbody cache ssl crt key allow_ips realip skipcookie sslverify
     domain=$(get_meta domain "$f");   target=$(get_meta target "$f")
     maxbody=$(get_meta maxbody "$f"); cache=$(get_meta cache "$f")
     ssl=$(get_meta ssl "$f"); crt=$(get_meta crt "$f"); key=$(get_meta key "$f")
     allow_ips=$(get_meta allow_ips "$f"); realip=$(get_meta realip "$f")
+    skipcookie=$(get_meta skipcookie "$f"); sslverify=$(get_meta sslverify "$f")
 
     echo "  本站当前 real_ip 可信上游：${realip:-（未设置，不还原真实 IP）}"
     echo "  输入「上游可信代理」的 IP/CIDR（上游边缘 nginx / CDN 回源地址），空格分隔。"
@@ -494,19 +497,12 @@ set_site_realip() {
         froms="${froms% }"
         [ -z "$froms" ] && { err "没有有效的 IP/CIDR，未改动。"; return 1; }
 
-        # 冲突防护：本站若同时用 allow/deny 锁上游 IP，real_ip 会在其之前改写
-        # $remote_addr 为真实访客 → 白名单只认上游 IP → 真实访客被 deny → 全站 403。
-        if [ -n "$allow_ips" ]; then
-            warn "本站已设 IP 访问白名单（allow/deny）：$allow_ips"
-            warn "real_ip 会在 allow/deny 之前把 \$remote_addr 改成真实访客 IP，"
-            warn "白名单只放行上游 IP → 真实访客会被判 403（你刚踩过这个坑）。"
-            warn "「只放行上游 IP」请改用云安全组 / iptables，勿与 real_ip 同站叠加。"
-            local yn; read -rp "  仍要为本站开启 real_ip？(y/N): " yn
-            case "$yn" in y|Y) : ;; *) info "已取消，未改动。"; return 1 ;; esac
-        fi
+        # 本站白名单按 $realip_remote_addr(真实 TCP 对端)geo 判定,不受 real_ip 改写影响,
+        # 两者可同站共存(锁上游 + 后端拿真实访客 IP 两不误),重新渲染即自动生效。
+        [ -n "$allow_ips" ] && info "本站已设 IP 白名单($allow_ips):按直连对端判定,与 real_ip 兼容,将一并重渲染。"
     fi
 
-    if render_site_safe "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$froms"; then
+    if render_site_safe "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$froms" "$skipcookie" "$sslverify"; then
         if [ -n "$froms" ]; then ok "已为 $domain 开启 real_ip，可信上游：$froms"
         else ok "已关闭 $domain 的 real_ip（恢复使用直连对端 IP）。"; fi
         restart_nginx   # 安全类变更：彻底重启清掉残留旧 worker，避免旧访问规则继续生效
@@ -521,11 +517,12 @@ set_site_realip() {
 set_site_allow_ips() {
     local f="$1"
     [ -f "$f" ] || { err "站点文件不存在：$f"; return 1; }
-    local domain target maxbody cache ssl crt key allow_ips realip
+    local domain target maxbody cache ssl crt key allow_ips realip skipcookie sslverify
     domain=$(get_meta domain "$f");   target=$(get_meta target "$f")
     maxbody=$(get_meta maxbody "$f"); cache=$(get_meta cache "$f")
     ssl=$(get_meta ssl "$f"); crt=$(get_meta crt "$f"); key=$(get_meta key "$f")
     allow_ips=$(get_meta allow_ips "$f"); realip=$(get_meta realip "$f")
+    skipcookie=$(get_meta skipcookie "$f"); sslverify=$(get_meta sslverify "$f")
 
     echo "  仅允许下列 IP/网段访问 $domain（空格分隔，支持 CIDR 如 1.2.3.0/24 或 IPv6）。"
     echo "  直接回车留空 = 清除白名单，恢复任意 IP 可访问。"
@@ -539,10 +536,9 @@ set_site_allow_ips() {
     if [ "$bad" = 1 ]; then
         err "含非法字符，IP/网段只能包含数字、字母(IPv6)、. : / ，已取消。"; return 1
     fi
-    if render_site_safe "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$newips" "$realip"; then
+    if render_site_safe "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$newips" "$realip" "$skipcookie" "$sslverify"; then
         if [ -n "$newips" ]; then
-            ok "已设置白名单，仅允许：$newips（其它来源 403）"
-            [ -n "$realip" ] && warn "本站同时开着 real_ip（$realip）：real_ip 会把 \$remote_addr 改成真实访客，白名单将按真实访客比对——若这是「锁上游 IP」用途会 403，请改用安全组/iptables。"
+            ok "已设置白名单，仅允许：$newips（其它来源 403；按直连对端 IP 判定，与 real_ip 共存不冲突）"
         else ok "已清除白名单，恢复任意 IP 可访问。"; fi
         restart_nginx   # 安全类变更：彻底重启清掉残留旧 worker，避免旧访问规则继续生效
         return 0
@@ -617,6 +613,33 @@ map $upstream_http_content_type $rp_skip_media {
     ~*mpegurl                  1;
     ~*dash\+xml                1;
 }
+
+# 登录态判定（普通/分片缓存的串号防护）。背景：nginx 做缓存决策时【不看】请求里的
+# Authorization 和 Cookie——只要响应是 200 且没带 Cache-Control/Set-Cookie，就按 URL
+# 缓存并共享给所有人。动态站里没规范发缓存头的私有接口（用户信息/通知等）会被缓给
+# 其他用户。故按常见会话/登录 cookie 名判定登录态，命中即绕过缓存。
+# 取舍：宁可匹配过宽（多回源、降命中率），不可漏（泄漏用户数据）。
+# 站点也可自填登录 cookie 名生成专属判定（建站/改缓存模式时询问，覆盖本列表）。
+map $http_cookie $rp_has_session {
+    default 0;
+    # 通用会话：session*/sess*/sid + PHP/Java/Node/Rails 风格(_app_session)
+    "~*(?:^|;[ \t]*)(sess[a-z0-9_-]*|sid|phpsessid|jsessionid|connect\.sid|_[a-z0-9]+_session)=" 1;
+    # 建站程序登录态：WordPress / XenForo
+    "~*(?:^|;[ \t]*)(wordpress_logged_in[^=;]*|wordpress_sec[^=;]*|wp-postpass[^=;]*|xf_user|xf_session)=" 1;
+    # 各类 token / 记住我 / 登录标记
+    "~*(?:^|;[ \t]*)(jwt|token|(access|refresh|id|api|user|auth)[_-]?token|auth[a-z0-9_-]*|remember_[a-z0-9_-]*|logged_in)=" 1;
+}
+
+# 静态缓存模式的扩展名判定：非静态后缀 → 1（跳过缓存，动态请求全透传）。
+# 故意不含视频后缀（视频请用分片缓存档）与 txt/xml/json（常是动态内容导出）。
+map $uri $rp_not_static {
+    default 1;
+    "~*\.(css|js|mjs|map|jpe?g|png|gif|webp|avif|svg|ico|bmp|cur|woff2?|ttf|otf|eot|mp3|pdf|zip|gz|br|wasm|webmanifest)$" 0;
+}
+
+# 回源时把 Accept-Encoding 归一成 gzip（见各缓存档 proxy_set_header）后，遇到不支持
+# gzip 的老客户端由本机解压兜底（Debian/Ubuntu 官方 nginx 均带 gunzip 模块）。
+gunzip on;
 EOF
     ensure_worker_shutdown_timeout
     neutralize_conf_gzip   # 消除 nginx.conf 默认 gzip 与本文件的重复声明
@@ -879,38 +902,36 @@ install_cert_to_nginx() {
     local domain="$1"
     local primary="${domain%% *}"   # acme 以第一个 -d 作为证书名；安装/存放统一用主域名
     mkdir -p "$CERT_DIR/$primary"
+    chmod 700 "$CERT_DIR/$primary"
     "$ACME" --install-cert -d "$primary" --ecc \
         --key-file       "$CERT_DIR/$primary/key.pem" \
         --fullchain-file "$CERT_DIR/$primary/fullchain.pem" \
-        --reloadcmd "systemctl reload nginx 2>/dev/null || kill -HUP \"\$(pgrep -o -x nginx)\" 2>/dev/null || systemctl start nginx 2>/dev/null || nginx"
+        --reloadcmd "systemctl reload nginx 2>/dev/null || kill -HUP \"\$(pgrep -o -x nginx)\" 2>/dev/null || systemctl start nginx 2>/dev/null || nginx" \
+        || return 1
+    # install-cert 是普通 cp,私钥权限跟随 umask(root 默认 022 → 644 世界可读)。收紧成仅 root:
+    # nginx master 以 root 读证书,不影响 worker。
+    chmod 600 "$CERT_DIR/$primary/key.pem" 2>/dev/null
+    chmod 644 "$CERT_DIR/$primary/fullchain.pem" 2>/dev/null
 }
 
 # ----------------------------- 渲染站点配置 ---------------------------------
-# 参数: domain target maxbody(MB) cache(none|normal|slice) ssl(none|le|dns|file) crt key
+# 参数: domain target maxbody(MB) cache(none|static|normal|micro[:秒]|slice) ssl(none|le|dns|file) crt key
+#       allow_ips realip skipcookie(自定义登录 cookie 名/正则，normal/micro/slice 档用，可空)
+#       sslverify(on=校验 https 回源的源站证书,防回源被中间人;源站自签/IP 回源留空)
 render_site_file() {
-    local domain="$1" target="$2" maxbody="$3" cache="$4" ssl="$5" crt="$6" key="$7" allow_ips="$8" realip="$9"
+    local domain="$1" target="$2" maxbody="$3" cache="$4" ssl="$5" crt="$6" key="$7" allow_ips="$8" realip="$9" skipcookie="${10}" sslverify="${11}"
     # domain 可含多个空格分隔域名（SAN）。主域名(第一个)用作文件名/软链/证书目录的唯一标识；
     # server_name 与 meta 写全部域名。
     local primary="${domain%% *}"
     local file="$SITES_AVAIL/$primary.conf"
 
-    # IP 访问白名单块：仅允许 allow_ips 里的 IP/网段访问 location /（其余 403）。
-    # 用途：回源域名只放行边缘 Nginx 的出口 IP。基于直连来源 $remote_addr 判断——
-    # 源站直接面向边缘机时有效；源站前若再套 CDN/代理则看不到真实边缘 IP。
-    # 只加在 location /，不动 acme-challenge，证书签发/续签不受影响。
-    local access_block="" _aip
-    if [ -n "$allow_ips" ]; then
-        for _aip in $allow_ips; do
-            access_block+="        allow ${_aip};"$'\n'
-        done
-        access_block+="        deny all;"$'\n'
-    fi
+    # (IP 访问白名单块在解析 target 之后构建——geo 变量名依赖 upstream 标识,见下方)
 
     # real_ip 块（server 级）：本站处在可信上游（边缘 nginx / CDN）之后时，从 XFF 还原真实
     # 客户端 IP，让本机日志/限流按真实访客计算。仅信任列出的上游，避免客户端伪造 XFF。
     # 放 server 级而非 location：real_ip 在 POST_READ 阶段执行，早于 location 匹配，
-    # 写进 location 不生效。⚠ 与同站「IP 白名单」(allow/deny 锁上游 IP) 叠加会 403——
-    # real_ip 先把 $remote_addr 改成真实访客，allow/deny 再按它比对就把访客挡了。
+    # 写进 location 不生效。与同站「IP 白名单」可共存：白名单按 $realip_remote_addr
+    # （真实 TCP 对端）判定，不受 real_ip 改写影响。
     local realip_block="" _rip
     if [ -n "$realip" ]; then
         for _rip in $realip; do
@@ -919,17 +940,6 @@ render_site_file() {
         realip_block+="    real_ip_header X-Forwarded-For;"$'\n'
         realip_block+="    real_ip_recursive on;"$'\n'
     fi
-
-    # 缓存指令块（$'' 内 nginx 变量保持字面量，\n 为真实换行）
-    local cache_block
-    case "$cache" in
-        none)
-            cache_block=$'        # 无缓存：关闭缓冲，适合纯流媒体/上传\n        proxy_buffering off;\n        proxy_request_buffering off;' ;;
-        normal)
-            cache_block=$'        # 普通缓存：缓存网页/静态；Range 请求或视频/音频/大文件自动绕过\n        proxy_cache rpcache;\n        proxy_cache_key $scheme$host$request_uri;\n        proxy_cache_valid 200 301 302 10m;\n        proxy_cache_valid 404 1m;\n        proxy_cache_bypass $http_range $arg_nocache;\n        proxy_no_cache $http_range $rp_skip_media;\n        add_header X-Cache-Status $upstream_cache_status always;' ;;
-        slice)
-            cache_block=$'        # 视频分片缓存：按 1MB 切片缓存 Range 响应（206）\n        slice 1m;\n        proxy_cache rpcache;\n        proxy_cache_key $scheme$host$uri$is_args$args$slice_range;\n        proxy_set_header Range $slice_range;\n        proxy_cache_valid 200 206 1d;\n        proxy_cache_valid 404 1m;\n        add_header X-Cache-Status $upstream_cache_status always;' ;;
-    esac
 
     # 解析 target → scheme / host:port / path，并生成 upstream 以启用到后端的 keepalive：
     # 复用 TCP/TLS 连接、减少握手开销（https 回源时尤为明显）。Connection 头由全局 map 控制：
@@ -950,12 +960,140 @@ render_site_file() {
     if [ "$up_scheme" = "https" ]; then
         host_hdr="$up_host"
         ssl_block=$'\n        proxy_ssl_server_name on;\n        proxy_ssl_name '"$up_host;"
+        # 可选:校验源站证书(公网可信证书的源站),防止回源链路被中间人。自签/IP 回源不开。
+        if [ "$sslverify" = "on" ]; then
+            ssl_block+=$'\n        proxy_ssl_verify on;\n        proxy_ssl_verify_depth 2;\n        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;'
+        fi
     fi
     local upstream_block="upstream $up_name {
     server $up_hostport;
     keepalive 32;
 }"
     local logname="/var/log/nginx/${primary}_access.log"
+
+    # IP 访问白名单：仅允许 allow_ips 里的 IP/网段访问 location /（其余 403），
+    # 用途：回源域名只放行边缘 Nginx 的出口 IP。
+    # 不用经典 allow/deny：它比对 $remote_addr，一旦本站/全局开了 real_ip，$remote_addr
+    # 会被改写成真实访客 IP → 「只放行上游」的白名单把所有访客都 403（实锤踩过）。
+    # 改用 geo 按 $realip_remote_addr（真实 TCP 对端，realip 模块内置变量，Debian/Ubuntu
+    # 官方 nginx 均编译）判定——它永远是直连来源、不受 real_ip 改写影响，白名单与 real_ip
+    # 从此可同站共存：锁上游 + 后端拿真实访客 IP 两不误。
+    # 只挡 location /，acme-challenge 不受影响，证书签发/续签照常。
+    local access_block="" allow_geo_block="" _aip
+    if [ -n "$allow_ips" ]; then
+        allow_geo_block="
+# 本站上游 IP 白名单（geo 按直连对端 \$realip_remote_addr 判定，与 real_ip 共存不冲突）
+geo \$realip_remote_addr \$${up_name}_deny {
+    default 1;"
+        for _aip in $allow_ips; do
+            allow_geo_block+=$'\n'"    ${_aip} 0;"
+        done
+        allow_geo_block+=$'\n}'
+        access_block="        if (\$${up_name}_deny) { return 403; }"$'\n'
+    fi
+
+    # 会话/登录态判定变量（普通/分片缓存的串号防护）：默认用全局通用列表($rp_has_session)；
+    # 站点自填了登录 cookie 名/正则则生成本站专属 map（【覆盖】内置列表，不叠加），解决两类
+    # 通用列表兜不住的场景：
+    #   ① 会话 cookie 名特殊（如含冒号的 nh:at——nginx 的 $cookie_名 语法根本表达不了冒号，
+    #      只能 map 整个 Cookie 头）；
+    #   ② 框架给匿名访客也发会话 cookie（如 laravel_session 人人都有），内置列表会把所有
+    #      访客判成登录 → 全站不缓；自填真正代表「已登录」的 cookie 名即可恢复命中率。
+    local skip_var='$rp_has_session' session_map_block=""
+    if [ -n "$skipcookie" ]; then
+        skip_var="\$${up_name}_sess"
+        session_map_block="
+# 本站自定义登录 cookie 判定（覆盖内置通用列表；名字锚定在 cookie 名起始处）
+map \$http_cookie \$${up_name}_sess {
+    default 0;
+    \"~*(?:^|;[ \\t]*)(?:${skipcookie})=\" 1;
+}"
+    fi
+
+    # 缓存指令块。要点（nginx 的缓存决策【不看】请求 Authorization/Cookie，须显式绕过）：
+    #   normal/slice → 带 Authorization 头或会话 cookie 的请求不读不写缓存，防私有响应串号；
+    #   static       → 只缓静态后缀，动态一律透传，天然不碰用户数据；
+    #   共同         → cache_lock 合并并发回源防击穿，use_stale 在源站故障/刷新中先吐旧缓存。
+    local cache_block
+    case "$cache" in
+        none)
+            cache_block=$'        # 无缓存：关闭缓冲，适合纯流媒体/上传/WebSocket/API\n'
+            cache_block+=$'        proxy_buffering off;\n'
+            cache_block+=$'        proxy_request_buffering off;'
+            ;;
+        static)
+            cache_block=$'        # 静态缓存：仅缓静态后缀（$rp_not_static 判定），动态请求全透传不缓——\n'
+            cache_block+=$'        # 适合带登录/个性化的动态站：加速静态、不碰用户数据。\n'
+            cache_block+=$'        # 带 Set-Cookie 的响应 nginx 默认不缓（防会话进缓存），故不必 ignore_headers。\n'
+            cache_block+=$'        # ⚠ 靠 cookie 门禁的私有静态文件（付费下载等）别用本档，或让源站对其发 no-store。\n'
+            cache_block+=$'        proxy_set_header Accept-Encoding gzip;   # 归一化编码，避免缓存按 AE 裂成多变体\n'
+            cache_block+=$'        proxy_cache rpcache;\n'
+            cache_block+=$'        proxy_cache_key $scheme$host$request_uri;\n'
+            cache_block+=$'        proxy_cache_valid 200 301 1d;\n'
+            cache_block+=$'        proxy_cache_valid 404 1m;\n'
+            cache_block+=$'        proxy_cache_bypass $rp_not_static $http_authorization $http_upgrade $http_range $arg_nocache;\n'
+            cache_block+=$'        proxy_no_cache    $rp_not_static $http_authorization $http_upgrade $http_range;\n'
+            cache_block+=$'        proxy_cache_lock on;\n'
+            cache_block+=$'        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;\n'
+            cache_block+=$'        proxy_cache_background_update on;\n'
+            cache_block+=$'        proxy_cache_revalidate on;\n'
+            cache_block+=$'        add_header X-Cache-Status $upstream_cache_status always;'
+            ;;
+        normal)
+            cache_block=$'        # 普通缓存：整站可缓，尊重源站 Cache-Control/Expires（no-store/private 不会被缓）。\n'
+            cache_block+=$'        # 登录态（Authorization 头/会话 cookie）不读不写缓存，防私有响应按 URL 串给他人。\n'
+            cache_block+=$'        proxy_set_header Accept-Encoding gzip;   # 归一化编码，避免缓存按 AE 裂成多变体\n'
+            cache_block+=$'        proxy_cache rpcache;\n'
+            cache_block+=$'        proxy_cache_key $scheme$host$request_uri;\n'
+            cache_block+=$'        proxy_cache_valid 200 301 302 10m;\n'
+            cache_block+=$'        proxy_cache_valid 404 1m;\n'
+            cache_block+=$'        # $http_upgrade:WebSocket 握手(GET+Upgrade)必须绕过——否则同 URL 已有缓存时,\n'
+            cache_block+=$'        # 握手会被缓存直接应答 200,永远升级不成 101,WS 功能整个报废\n'
+            cache_block+=$'        proxy_cache_bypass $http_authorization '"$skip_var"$' $http_upgrade $http_range $arg_nocache;\n'
+            cache_block+=$'        proxy_no_cache    $http_authorization '"$skip_var"$' $http_upgrade $http_range $rp_skip_media;\n'
+            cache_block+=$'        proxy_cache_lock on;                     # 并发 MISS 合并成 1 次回源，防击穿\n'
+            cache_block+=$'        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;\n'
+            cache_block+=$'        proxy_cache_background_update on;        # 过期先吐旧的，后台静默刷新\n'
+            cache_block+=$'        proxy_cache_revalidate on;               # 过期后走 If-None-Match/304 廉价续期\n'
+            cache_block+=$'        add_header X-Cache-Status $upstream_cache_status always;'
+            ;;
+        micro|micro:*)
+            local micro_ttl=60
+            case "$cache" in micro:*) micro_ttl="${cache#micro:}" ;; esac
+            cache_block=$'        # 微缓存：匿名动态页强缓短 TTL——ignore_headers 忽略源站 no-store（本档的存在\n'
+            cache_block+=$'        # 意义：Next/Nuxt 等框架的动态 SSR 页默认全发 no-store，不忽略永远缓不上）。\n'
+            cache_block+=$'        # 只对匿名生效：登录态（Authorization/会话 cookie）全绕过，页面须对所有匿名访客\n'
+            cache_block+=$'        # 一致。$http_rsc 是 Next SPA 导航头（要 RSC 载荷非 HTML），须绕过；他站恒空无副作用。\n'
+            cache_block+=$'        # 逃生阀：本档不忽略 X-Accel-Expires，源站对个别路径发 X-Accel-Expires: 0 即拒缓。\n'
+            cache_block+=$'        proxy_set_header Accept-Encoding gzip;   # 归一化编码，避免缓存按 AE 裂成多变体\n'
+            cache_block+=$'        proxy_cache rpcache;\n'
+            cache_block+=$'        proxy_cache_key $scheme$host$request_uri;\n'
+            cache_block+=$'        proxy_ignore_headers Cache-Control Expires;\n'
+            cache_block+="        proxy_cache_valid 200 ${micro_ttl}s;"$'\n'
+            cache_block+=$'        proxy_cache_valid 404 10s;\n'
+            cache_block+=$'        proxy_cache_bypass $http_authorization '"$skip_var"$' $http_rsc $http_upgrade $http_range $arg_nocache;\n'
+            cache_block+=$'        proxy_no_cache    $http_authorization '"$skip_var"$' $http_rsc $http_upgrade $http_range $rp_skip_media;\n'
+            cache_block+=$'        proxy_cache_lock on;                     # 几十并发打同一页 → 只回源渲染 1 次\n'
+            cache_block+=$'        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;\n'
+            cache_block+=$'        proxy_cache_background_update on;        # 过期先吐旧的，后台静默刷新，源站无感\n'
+            cache_block+=$'        proxy_cache_revalidate on;               # 静态资源（immutable 头同被忽略）过期走 304 廉价续期\n'
+            cache_block+=$'        add_header X-Cache-Status $upstream_cache_status always;'
+            ;;
+        slice)
+            cache_block=$'        # 视频分片缓存：按 1MB 切片缓存 Range 响应（206）。\n'
+            cache_block+=$'        # 登录态绕过防私有视频串号；视频公开但用户常登录的站，自填登录 cookie 保命中率。\n'
+            cache_block+=$'        slice 1m;\n'
+            cache_block+=$'        proxy_cache rpcache;\n'
+            cache_block+=$'        proxy_cache_key $scheme$host$uri$is_args$args$slice_range;\n'
+            cache_block+=$'        proxy_set_header Range $slice_range;\n'
+            cache_block+=$'        proxy_cache_valid 200 206 1d;\n'
+            cache_block+=$'        proxy_cache_valid 404 1m;\n'
+            cache_block+=$'        proxy_cache_bypass $http_authorization '"$skip_var"$' $http_upgrade;\n'
+            cache_block+=$'        proxy_no_cache    $http_authorization '"$skip_var"$' $http_upgrade;\n'
+            cache_block+=$'        proxy_cache_lock on;\n'
+            cache_block+=$'        add_header X-Cache-Status $upstream_cache_status always;'
+            ;;
+    esac
 
     # 元信息（manage 解析用）。整份内容先写临时文件，最后原子 mv 到位：
     # 避免「先 > 写元信息、再 >> 追加 server 块」中途被打断（Ctrl-C/断连/信号）
@@ -967,6 +1105,8 @@ render_site_file() {
         echo "# target=$target"
         echo "# maxbody=$maxbody"
         echo "# cache=$cache"
+        echo "# skipcookie=$skipcookie"
+        echo "# sslverify=$sslverify"
         echo "# ssl=$ssl"
         echo "# crt=$crt"
         echo "# key=$key"
@@ -979,7 +1119,7 @@ render_site_file() {
         cat >> "$tmp" <<EOF
 
 $upstream_block
-
+$allow_geo_block$session_map_block
 server {
     listen 80;
     listen [::]:80;
@@ -1012,7 +1152,7 @@ EOF
         cat >> "$tmp" <<EOF
 
 $upstream_block
-
+$allow_geo_block$session_map_block
 server {
     listen 80;
     listen [::]:80;
@@ -1084,6 +1224,10 @@ render_site_safe() {
     fi
     if [ -L "$link" ] || [ -e "$link" ]; then had_link=1; fi
 
+    # 全局配置守卫：缓存块引用 $rp_has_session/$rp_not_static 等全局 map。脚本自更新后，
+    # 老机器的全局配置可能还没有这些定义 → 渲染必定 nginx -t 失败。缺了就补写（幂等）。
+    grep -q 'rp_not_static' "$GLOBAL_CONF" 2>/dev/null || ensure_global_conf
+
     render_site_file "$@"
 
     if reload_nginx; then
@@ -1128,26 +1272,87 @@ get_meta() {  # get_meta <key> <file>
 
 # ----------------------------- 缓存模式选择 ---------------------------------
 choose_cache_mode() {
-    # 结果写入全局变量 CACHE_MODE
+    # 结果写入全局变量 CACHE_MODE / CACHE_SKIPCOOKIE
+    CACHE_SKIPCOOKIE=""
     echo "  请选择该站点的缓存模式：" >&2
-    echo "    1) 无缓存      —— 关闭缓冲，纯流媒体/直连源站（推荐）" >&2
-    echo "    2) 普通缓存    —— 缓存网页/静态，Range 与视频自动绕过" >&2
-    echo "    3) 视频分片缓存 —— slice 切片缓存 Range 响应（源站直链带签名时命中率低，慎用）" >&2
-    local c; read -rp "  输入 [1-3]（默认1）: " c
+    echo "" >&2
+    echo "  1) 无缓存（默认，最稳妥）" >&2
+    echo "     什么都不缓，关闭缓冲直通后端。" >&2
+    echo "     适合：流媒体推拉流 / 大文件上传 / WebSocket / 纯 API 服务。" >&2
+    echo "" >&2
+    echo "  2) 静态缓存" >&2
+    echo "     只缓「带静态后缀」的资源（css/js/图片/字体等，缓 1 天，过期后 304 廉价续期）；" >&2
+    echo "     HTML 页面、接口等动态请求一律直通、绝不缓存。" >&2
+    echo "     适合：带登录/个性化的动态网站——只加速静态文件，不可能把用户数据缓给别人。" >&2
+    echo "" >&2
+    echo "  3) 普通缓存" >&2
+    echo "     整站都可以进缓存，但「听源站的话」：源站响应头说不缓（no-store 等）就不缓，" >&2
+    echo "     没表态的按 10 分钟缓。带登录态的请求（Authorization 头/会话 cookie）自动绕过，" >&2
+    echo "     防止私有内容串给其他用户。" >&2
+    echo "     适合：内容对所有人都一样的公开站（博客/文档/展示页/下载站）。" >&2
+    echo "" >&2
+    echo "  4) 微缓存" >&2
+    echo "     动态页也强制缓 N 秒（默认 60，无视源站的「不许缓」标记），登录请求照常绕过。" >&2
+    echo "     几十个并发打同一页时源站只渲染 1 次，其余全吃缓存——小机器扛并发的利器。" >&2
+    echo "     适合：匿名访客为主的动态站（内容站/论坛游客页）。" >&2
+    echo "     ⚠ 登录 cookie 必须配准：识别不到登录态 = 用户的私有页面会被缓给别人（串号）！" >&2
+    echo "" >&2
+    echo "  5) 视频分片缓存" >&2
+    echo "     视频按 1MB 切片缓存 Range 响应，拖进度条命中已缓分片不回源。" >&2
+    echo "     适合：自建视频/网盘直链的回源加速；直链带时效签名参数时命中率会很低。" >&2
+    echo "" >&2
+    local c; read -rp "  输入 [1-5]（默认1）: " c
     case "$c" in
-        2) CACHE_MODE="normal" ;;
-        3) CACHE_MODE="slice" ;;
+        2) CACHE_MODE="static" ;;
+        3) CACHE_MODE="normal" ;;
+        4) CACHE_MODE="micro" ;;
+        5) CACHE_MODE="slice" ;;
         *) CACHE_MODE="none" ;;
+    esac
+    # 微缓存的 TTL：默认 60s；自定义时以 micro:N 记进 meta（不另加参数贯穿全链）
+    if [ "$CACHE_MODE" = "micro" ]; then
+        local t; read -rp "  微缓存秒数 [5-600]（默认 60）: " t
+        case "$t" in ''|*[!0-9]*) t=60 ;; esac
+        [ "$t" -lt 5 ] && t=5; [ "$t" -gt 600 ] && t=600
+        [ "$t" != 60 ] && CACHE_MODE="micro:$t"
+    fi
+    # 普通/微/分片缓存的登录态识别默认用内置通用 cookie 列表，两类站点建议自填：
+    #   ① 登录 cookie 名特殊，内置列表匹配不到（漏判 → 有串号风险）；
+    #   ② 框架给匿名访客也发会话 cookie（如 laravel_session 人人都有），内置列表把
+    #      所有访客判成登录 → 全站不缓；自填真正的「已登录」cookie 名可恢复命中率。
+    case "$CACHE_MODE" in normal|slice|micro*)
+        echo "  自定义登录 cookie 名/正则（可选，支持 a|b 多选一）：" >&2
+        echo "  填写后【只】按它判定登录态（内置通用列表对本站失效）。" >&2
+        [ "${CACHE_MODE%%:*}" = "micro" ] && \
+            echo "  ⚠ 微缓存会强缓源站标记不缓存的页面，登录 cookie 识别不到=串号，务必配准。" >&2
+        read -rp "  登录 cookie（留空=用内置通用列表识别）: " CACHE_SKIPCOOKIE
+        CACHE_SKIPCOOKIE="${CACHE_SKIPCOOKIE//\"/}"   # 去掉双引号，防拼进 nginx 配置串壳
+        ;;
+    esac
+}
+
+# ----------------------------- https 回源证书校验询问 -----------------------
+# 目标是 https 时询问是否校验源站证书,结果写全局 SSL_VERIFY(on/空);http 目标直接置空。
+# 默认不开:很多回源目标是自签证书/IP,开了必 502;源站有公网可信证书才建议开。
+ask_ssl_verify() {
+    SSL_VERIFY=""
+    case "$1" in
+        https://*)
+            echo "  回源目标是 https。是否校验源站证书(防回源链路被中间人)?" >&2
+            echo "  源站用公网可信证书(Let's Encrypt 等)→ y;自签证书 / IP 回源 → N。" >&2
+            local v; read -rp "  校验源站证书？(y/N): " v
+            case "$v" in y|Y) SSL_VERIFY="on" ;; esac
+            ;;
     esac
 }
 
 # ----------------------------- 选择并应用 HTTPS 证书 ------------------------
 # 弹证书方式菜单并落地（渲染站点 + reload）。新建/管理换证书共用，所以「申请失败」
 # 后进管理也能改选别的方式（HTTP-01 / DNS / 本地证书 / 仅 HTTP）。
-# 用法: apply_https_cert <domain> <target> <maxbody> <cache> [allow_ips] [realip]
+# 用法: apply_https_cert <domain> <target> <maxbody> <cache> [allow_ips] [realip] [skipcookie] [sslverify]
 # 返回: 0=已写入并启用了可用站点配置（HTTP 或 HTTPS）；1=失败/取消，未写可用配置
 apply_https_cert() {
-    local domain="$1" target="$2" maxbody="$3" cache="$4" allow_ips="$5" realip="$6"
+    local domain="$1" target="$2" maxbody="$3" cache="$4" allow_ips="$5" realip="$6" skipcookie="$7" sslverify="$8"
     local primary="${domain%% *}"   # 多域名时证书目录按主域名
     echo "  请选择 HTTPS 证书方式："
     echo "    1) acme.sh 自动申请（HTTP-01，需 80 端口可达，推荐）"
@@ -1157,7 +1362,7 @@ apply_https_cert() {
     local s; read -rp "  输入 [1-4]（默认1）: " s
     case "$s" in
         4)
-            render_site_safe "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips" "$realip" \
+            render_site_safe "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
                 && { ok "已设为仅 HTTP：http://$domain"; return 0; }
             return 1 ;;
         3)
@@ -1165,7 +1370,7 @@ apply_https_cert() {
             read -rp "  证书 fullchain 路径: " crt
             read -rp "  私钥 key 路径: " key
             if [ ! -f "$crt" ] || [ ! -f "$key" ]; then err "证书文件不存在"; return 1; fi
-            render_site_safe "$domain" "$target" "$maxbody" "$cache" "file" "$crt" "$key" "$allow_ips" "$realip" \
+            render_site_safe "$domain" "$target" "$maxbody" "$cache" "file" "$crt" "$key" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
                 && { ok "已启用（本地证书）：https://$domain"; return 0; }
             return 1 ;;
         2)
@@ -1174,17 +1379,17 @@ apply_https_cert() {
             local prov; case "$dp" in 1) prov=cloudflare;; 2) prov=aliyun;; 3) prov=tencent;; *) err "无效"; return 1;; esac
             if issue_cert_dns "$domain" "$prov" && install_cert_to_nginx "$domain"; then
                 render_site_safe "$domain" "$target" "$maxbody" "$cache" "dns" \
-                    "$CERT_DIR/$primary/fullchain.pem" "$CERT_DIR/$primary/key.pem" "$allow_ips" "$realip" \
+                    "$CERT_DIR/$primary/fullchain.pem" "$CERT_DIR/$primary/key.pem" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
                     && { ok "已启用（HTTPS + 泛域名证书）：https://$domain"; return 0; }
             fi
             err "证书申请或配置失败。"; return 1 ;;
         *)
             # 先建/保留 HTTP 站点承载 acme challenge，再签发，最后换成 HTTPS
-            render_site_safe "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips" "$realip" \
+            render_site_safe "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
                 || { err "初始 HTTP 配置失败"; return 1; }
             if issue_cert_http "$domain" && install_cert_to_nginx "$domain"; then
                 render_site_safe "$domain" "$target" "$maxbody" "$cache" "le" \
-                    "$CERT_DIR/$primary/fullchain.pem" "$CERT_DIR/$primary/key.pem" "$allow_ips" "$realip" \
+                    "$CERT_DIR/$primary/fullchain.pem" "$CERT_DIR/$primary/key.pem" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
                     && ok "已启用（HTTPS + 自动证书）：https://$domain"
             else
                 err "证书申请失败，已保留仅 HTTP 站点。请检查域名解析 / 80 端口可达性，或改用 DNS API / 本地证书。"
@@ -1217,8 +1422,9 @@ configure_reverse_proxy() {
     case "$maxbody" in *[!0-9]*) warn "大小需为数字，已改用默认 1024"; maxbody=1024 ;; esac
 
     choose_cache_mode
+    ask_ssl_verify "$target"
 
-    if apply_https_cert "$domain" "$target" "$maxbody" "$CACHE_MODE" "" ""; then created=1; fi
+    if apply_https_cert "$domain" "$target" "$maxbody" "$CACHE_MODE" "" "" "$CACHE_SKIPCOOKIE" "$SSL_VERIFY"; then created=1; fi
 
     # 反代建好后的两个收尾询问：
     if [ "$created" = 1 ]; then
@@ -1381,16 +1587,17 @@ manage_managed_site() {
     local f="$1"
     while true; do
         [ -f "$f" ] || return   # 站点文件已不存在（被删除等）→ 退出到列表
-        local domain target maxbody cache ssl crt key allow_ips realip
+        local domain target maxbody cache ssl crt key allow_ips realip skipcookie sslverify
         domain=$(get_meta domain "$f"); target=$(get_meta target "$f")
         maxbody=$(get_meta maxbody "$f"); cache=$(get_meta cache "$f")
         ssl=$(get_meta ssl "$f"); crt=$(get_meta crt "$f"); key=$(get_meta key "$f")
         allow_ips=$(get_meta allow_ips "$f"); realip=$(get_meta realip "$f")
+        skipcookie=$(get_meta skipcookie "$f"); sslverify=$(get_meta sslverify "$f")
         local primary="${domain%% *}"   # 多域名时的主域名（文件/软链/证书目录标识）
 
         clear
         c_green "===== 管理站点：$domain ====="
-        echo "  当前： $domain -> $target  [缓存:$cache 证书:$ssl 上限:${maxbody}m]"
+        echo "  当前： $domain -> $target  [缓存:$cache${skipcookie:+(登录cookie:$skipcookie)} 证书:$ssl${sslverify:+ 回源验证:on} 上限:${maxbody}m]"
         echo "         IP 白名单：${allow_ips:-未设置（任意 IP 可访问）}"
         echo "         真实IP透传：${realip:-未设置}（real_ip 可信上游）"
         echo "    1) 修改反代目标"
@@ -1410,17 +1617,19 @@ manage_managed_site() {
                     || { err "目标格式不对，应形如 http://127.0.0.1:8080 或 https://源站域名"; pause; continue; }
                 [ "$nt" != "$target" ] && info "已自动补全为：$nt"
                 target="$nt"
-                render_site_safe "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$realip" \
+                ask_ssl_verify "$target"   # 目标变了,https 回源证书校验重新问(http 目标自动置空)
+                render_site_safe "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$realip" "$skipcookie" "$SSL_VERIFY" \
                     && ok "目标已更新"
                 ;;
             2)
                 choose_cache_mode
-                render_site_safe "$domain" "$target" "$maxbody" "$CACHE_MODE" "$ssl" "$crt" "$key" "$allow_ips" "$realip" \
-                    && ok "缓存模式已改为 $CACHE_MODE"
+                render_site_safe "$domain" "$target" "$maxbody" "$CACHE_MODE" "$ssl" "$crt" "$key" "$allow_ips" "$realip" "$CACHE_SKIPCOOKIE" "$sslverify" \
+                    && { ok "缓存模式已改为 $CACHE_MODE${CACHE_SKIPCOOKIE:+（登录cookie: $CACHE_SKIPCOOKIE）}"
+                         purge_site_cache "$domain"; }   # 换档后清掉旧档缓存条目，防旧策略残留继续命中
                 ;;
             3)
                 ensure_global_conf
-                apply_https_cert "$domain" "$target" "$maxbody" "$cache" "$allow_ips" "$realip"
+                apply_https_cert "$domain" "$target" "$maxbody" "$cache" "$allow_ips" "$realip" "$skipcookie" "$sslverify"
                 ;;
             4)
                 read -rp "  确认删除 $domain ？(y/N): " yn
@@ -1459,7 +1668,7 @@ manage_managed_site() {
                 local nm; read -rp "  新的上传上限 MB（当前 ${maxbody}）: " nm
                 [ -z "$nm" ] && { info "未改动"; pause; continue; }
                 case "$nm" in *[!0-9]*) err "需为数字"; pause; continue ;; esac
-                render_site_safe "$domain" "$target" "$nm" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$realip" \
+                render_site_safe "$domain" "$target" "$nm" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
                     && ok "上传上限已改为 ${nm}m"
                 ;;
             0) return ;;
@@ -1585,7 +1794,7 @@ import_external_site() {
     ensure_sites_enabled_include
     ensure_global_conf
     local managed="$SITES_AVAIL/$domain.conf"
-    render_site_file "$domain" "$target" "$maxbody" "none" "$ssl" "$crt" "$key" "$allow_ips" "$realip"
+    render_site_file "$domain" "$target" "$maxbody" "none" "$ssl" "$crt" "$key" "$allow_ips" "$realip" "" ""
 
     # 原文件 ≠ 受管文件 → 停用原文件，避免 server_name 重复冲突
     local disabled_old="" e
