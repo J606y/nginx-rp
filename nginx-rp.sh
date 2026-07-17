@@ -1536,7 +1536,13 @@ discover_proxies() {
         fi
         domain=$(_first_server_name "$f"); [ -z "$domain" ] && domain=$(get_meta domain "$f")
         [ -z "$domain" ] && domain="(未知)"
-        target=$(_first_proxy_pass "$f");  [ -z "$target" ] && target=$(get_meta target "$f")
+        # 受管站点的 proxy_pass 指向内部 upstream 名（rp_xxx_cksum），对用户无意义；
+        # meta 里的 target 才是真实反代目标（IP:端口 / 源站域名），与外部站点显示对齐。
+        if [ "$is_managed" = 1 ]; then
+            target=$(get_meta target "$f"); [ -z "$target" ] && target=$(_first_proxy_pass "$f")
+        else
+            target=$(_first_proxy_pass "$f"); [ -z "$target" ] && target=$(get_meta target "$f")
+        fi
         [ -z "$target" ] && target="?"
         enabled=$(_site_enabled "$f")
         printf '%s|%s|%s|%s|%s\n' "$f" "$kind" "$domain" "$target" "$enabled"
