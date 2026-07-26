@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: 静态检查（shellcheck + 语法）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck --version
+
+      - name: bash 语法检查
+        run: |
+          bash -n nginx-rp.sh
+          bash -n tests/unit.sh
+          bash -n tests/integration/run.sh
+
+      - name: shellcheck（warning 级别零告警）
+        run: shellcheck -S warning nginx-rp.sh tests/unit.sh tests/integration/run.sh
+
+      - name: 行尾必须是 LF
+        # 脚本用 bash <(curl ...) 直接执行，CRLF 会让 shebang 与命令全部带 \r 而失败
+        run: |
+          if grep -qlU $'\r' nginx-rp.sh; then
+            echo "nginx-rp.sh 含 CRLF 行尾，Linux 上会执行失败"
+            exit 1
+          fi
+
+  unit:
+    name: 单测（纯函数）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 运行单测
+        run: bash tests/unit.sh
+
+  integration:
+    name: 集成测试（Debian + 真实 nginx）
+    runs-on: ubuntu-latest
+    needs: [lint, unit]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建测试镜像
+        run: docker build -f tests/integration/Dockerfile -t nginx-rp-it .
+
+      - name: 运行集成测试
+        run: docker run --rm nginx-rp-it

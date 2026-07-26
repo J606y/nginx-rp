@@ -27,8 +27,11 @@
 - **真实客户端 IP 透传（real_ip）**：多台 nginx 串/并联或 CDN 回源时，从 `X-Forwarded-For` 还原真实访客 IP，后端日志/限流按真实访客计算（不开的话后端只能看到边缘 nginx 的 IP）；支持全局开关与按站点设置。
 - **接管本机所有反代**：自动发现非本脚本创建的 nginx 反代配置，支持启停、删除（可选备份）与导入接管，接管后享受同等管理能力。
 - **站点全生命周期管理**：改反代目标 / 缓存档位 / 上传上限（`client_max_body_size`）/ 换证书；删除站点时连带清理缓存条目与访问日志，并可选删除证书、停止续签。
-- **运维入口**：nginx 运行状态、`nginx -t`、reload / restart、错误与访问日志速览。
-- **快捷命令 `n`**：首次运行后安装到 `/usr/local/bin`，以后任意目录输入 `n` 即可打开菜单（非 root 自动 `sudo` 提权）。
+- **运维入口**：nginx 运行状态、`nginx -t`、reload / restart、错误与访问日志速览、本脚本操作记录。
+- **操作可追溯**：每次改动（建站 / 改配置 / 删站 / 封端口 / 证书签发删除 / 改主配置）都记进 `/var/log/nginx-rp.log`，含时间与操作者，出问题能查到是谁在什么时候改了什么。日志超过 10MB 自动截断。
+- **改动要么生效、要么回滚**：站点配置渲染失败或 `nginx -t` 不通过时，自动恢复到操作前的文件与软链状态，绝不留下半截配置，也不会在没真正生效时报告成功。
+- **单实例保护**：同一台机器上第二个实例会被拒绝启动，避免两个窗口同时改配置互相覆盖。
+- **快捷命令 `n`**：首次运行后安装到 `/usr/local/bin`，以后任意目录输入 `n` 即可打开菜单（非 root 自动 `sudo` 提权）。卸载 Nginx 时可选择一并移除。
 - **脚本自更新**：菜单「更新本脚本」从 GitHub 拉最新版（优先 API 端点避开 CDN 缓存，失败回退 raw），语法校验通过才覆盖。
 
 ## 一键安装 / 运行
@@ -59,7 +62,9 @@ n
 
 - Debian / Ubuntu（使用 `apt`）
 - root 权限（`sudo`）
-- 推荐 nginx ≥ 1.25；`ssl_reject_handshake`（禁 IP 直连的 HTTPS 兜底）需要 nginx ≥ 1.19.4，更老版本会自动回落到自签证书 + 444
+- nginx 版本无硬性要求，脚本会按本机版本自动适配语法：
+  - HTTP/2：≥ 1.25.1 用 `http2 on;`，更早版本用 `listen ... http2`（Debian 12 官方源是 1.22.1）
+  - 禁 IP 直连的 HTTPS 兜底：≥ 1.19.4 用 `ssl_reject_handshake`，更早版本回落到自签证书 + 444
 
 ## 菜单一览
 
@@ -88,16 +93,42 @@ n
 | `/etc/nginx/conf.d/00-nginx-rp.conf` | 公共配置：缓存区、WebSocket map、媒体/登录态/静态后缀判定 map |
 | `/etc/nginx/conf.d/00-deny-direct-ip.conf` | 「禁止 IP 直连」兜底 server（开启后存在） |
 | `/etc/nginx/conf.d/00-nginx-rp-realip.conf` | real_ip 全局可信上游配置（开启后存在） |
-| `/etc/nginx/nginx-rp-backups/` | 导入 / 删除站点配置前的备份 |
+| `/etc/nginx/nginx.conf` | **会被修改**（三处，见下方「对主配置的改动」），每次修改前自动备份 |
+| `/etc/nginx/nginx-rp-backups/` | 导入 / 删除站点、修改主配置前的备份 |
+| `/etc/nginx/nginx-rp-blocked-ports` | 已封锁的后端端口清单，用于重启后自动补回规则 |
 | `/etc/nginx/certs/<域名>/` | 安装到 Nginx 的证书（fullchain.pem / key.pem） |
 | `/var/cache/nginx/nginx_rp` | 反代缓存目录 |
+| `/var/log/nginx-rp.log` | 本脚本的操作记录（菜单「运维 → 查看本脚本操作记录」可看） |
+| `/var/log/nginx/<域名>_access.log` | 各站点访问日志 |
 | `~/.acme.sh/` | acme.sh 与自动续签 cron |
+
+## 对主配置的改动
+
+脚本会在必要时修改 `/etc/nginx/nginx.conf`，共三处，**每次修改前都会先备份到 `/etc/nginx/nginx-rp-backups/`**：
+
+| 改动 | 原因 |
+| --- | --- |
+| 补 `include /etc/nginx/sites-enabled/*;` | 部分精简安装只 include `conf.d`，不补的话站点配置根本不会被加载 |
+| 加 `worker_shutdown_timeout 30s;` | 限制 reload 后旧 worker 的存活上限，否则长连接会让旧配置长期残留 |
+| 注释 `http{}` 里的 `gzip` 指令 | 与本脚本公共配置的 gzip 声明重复会导致 `nginx -t` 失败；只处理 `http{}` 直接子级，你写在 `server{}` / `location{}` 里的 gzip 不受影响 |
 
 ## 注意
 
 - 云厂商安全组 / 安全列表（Oracle、阿里云等）需另在控制台收紧；本脚本只改本机 iptables。
 - 「禁止 IP 直连」会停用系统自带的 `sites-enabled/default`（它也占 `default_server`，否则冲突）。
 - DNS API 泛域名需要对应服务商的 API 凭据，按提示输入。
+- 后端端口封锁用的是 iptables 规则，Docker 或主机重启会清掉它们；脚本每次启动会自动补回（依据 `/etc/nginx/nginx-rp-blocked-ports`）。
+- 同一时间只能运行一个实例，第二个会被拒绝并提示。
+
+## 开发
+
+```bash
+bash tests/unit.sh                    # 纯函数单测，无需 root / nginx
+docker build -f tests/integration/Dockerfile -t nginx-rp-it . && docker run --rm nginx-rp-it
+shellcheck -S warning nginx-rp.sh     # 需保持零告警
+```
+
+内部设计与技术债记录见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 ## 致谢
 

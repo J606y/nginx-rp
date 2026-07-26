@@ -20,20 +20,35 @@
 
 set -o pipefail
 
+# 本文件多处刻意依赖单词分割：站点元信息(meta)里的域名/IP 列表就是「空格分隔字符串」这一
+# 契约本身，遍历时必须分词（for d in $domain）。这些位置均已配套字符白名单校验。
+# shellcheck disable=SC2086
+
 # ----------------------------- 全局变量 -------------------------------------
-SITES_AVAIL="/etc/nginx/sites-available"
-SITES_ENABLED="/etc/nginx/sites-enabled"
-GLOBAL_CONF="/etc/nginx/conf.d/00-nginx-rp.conf"
-DENY_IP_CONF="/etc/nginx/conf.d/00-deny-direct-ip.conf"   # 禁止用 IP 直连的兜底 server
-REALIP_CONF="/etc/nginx/conf.d/00-nginx-rp-realip.conf"   # 信任上游代理、从 XFF 还原真实客户端 IP
-CERT_DIR="/etc/nginx/certs"
-BACKUP_DIR="/etc/nginx/nginx-rp-backups"   # 导入/删除外部配置前的备份目录
-NGINX_CONF_D="/etc/nginx/conf.d"           # 发现/管理外部反代时用（可被测试覆盖）
-ACME_WEBROOT="/var/www/acme"
-CACHE_DIR="/var/cache/nginx/nginx_rp"
-ACME_HOME="$HOME/.acme.sh"
+# 路径一律写成 ${VAR:-默认值}：生产环境取默认值，集成测试可用环境变量整体重定向到
+# 沙箱目录，从而在容器里真实跑渲染/回滚而不碰系统配置。sudo 默认 env_reset，
+# 不会把用户环境带进来。
+SITES_AVAIL="${SITES_AVAIL:-/etc/nginx/sites-available}"
+SITES_ENABLED="${SITES_ENABLED:-/etc/nginx/sites-enabled}"
+NGINX_CONF_D="${NGINX_CONF_D:-/etc/nginx/conf.d}"           # 发现/管理外部反代时用
+NGINX_CONF="${NGINX_CONF:-/etc/nginx/nginx.conf}"           # 主配置（本脚本会修改，改前备份）
+GLOBAL_CONF="${GLOBAL_CONF:-$NGINX_CONF_D/00-nginx-rp.conf}"
+DENY_IP_CONF="${DENY_IP_CONF:-$NGINX_CONF_D/00-deny-direct-ip.conf}"   # 禁止用 IP 直连的兜底 server
+REALIP_CONF="${REALIP_CONF:-$NGINX_CONF_D/00-nginx-rp-realip.conf}"    # 信任上游代理、从 XFF 还原真实客户端 IP
+CERT_DIR="${CERT_DIR:-/etc/nginx/certs}"
+BACKUP_DIR="${BACKUP_DIR:-/etc/nginx/nginx-rp-backups}"     # 导入/删除/改主配置前的备份目录
+ACME_WEBROOT="${ACME_WEBROOT:-/var/www/acme}"
+CACHE_DIR="${CACHE_DIR:-/var/cache/nginx/nginx_rp}"
+LOG_DIR="${LOG_DIR:-/var/log/nginx}"                        # nginx 访问/错误日志目录
+AUDIT_LOG="${AUDIT_LOG:-/var/log/nginx-rp.log}"             # 本脚本的操作审计日志
+AUDIT_MAX_BYTES="${AUDIT_MAX_BYTES:-10485760}"              # 审计日志上限 10MB，超出自截断保留后半
+LOCK_FILE="${LOCK_FILE:-/var/lock/nginx-rp.lock}"           # 单实例锁：防两个终端并发改同一份配置
+BLOCKED_PORTS_FILE="${BLOCKED_PORTS_FILE:-/etc/nginx/nginx-rp-blocked-ports}"   # 已封锁端口清单，供重启后自愈
+ACME_HOME="${ACME_HOME:-$HOME/.acme.sh}"
 ACME="$ACME_HOME/acme.sh"
 REQUIRED_PORTS=(80 443)
+
+NGINX_CONF_BACKED_UP=0   # 本次运行是否已备份过 nginx.conf（避免每次 reload 都堆备份）
 
 # 快捷命令：安装到固定路径后，输入 SHORTCUT_CMD 即可打开本菜单
 INSTALL_PATH="/usr/local/bin/nginx-rp.sh"
@@ -56,6 +71,62 @@ warn()  { c_yellow "[!] $*"; }
 err()   { c_red   "[✗] $*"; }
 
 pause() { read -rp "按回车键继续..." _; }
+
+# 菜单选项读取。所有 while true 菜单都必须走它：read 读到 EOF（stdin 被关闭、
+# 非交互环境、管道结束）时返回非 0 且不赋值，若按「无效选项」处理就会瞬间无限刷屏。
+read_choice() {   # read_choice <提示> <目标变量名>
+    local __prompt="$1" __var="$2" __val
+    if ! read -rp "$__prompt" __val; then
+        echo
+        warn "输入已结束（EOF），退出。"
+        exit 0
+    fi
+    printf -v "$__var" '%s' "$__val"
+}
+
+# ----------------------------- 操作审计 -------------------------------------
+# 把「改变了系统状态」的操作记进 $AUDIT_LOG：本脚本会动 nginx 主配置、iptables、证书、
+# cron 与缓存，出问题时没有记录就无从追溯。只记变更，不记菜单浏览与查看类操作。
+# 注意：日志写入失败一律静默且不返回错误——审计是旁路，不能让它阻断运维操作本身。
+audit() {
+    local ts sz
+    ts="$(date '+%F %T' 2>/dev/null)"
+    # 超上限自截断保留后半，避免长期运行把磁盘写满（不引入 logrotate 依赖）
+    if [ -f "$AUDIT_LOG" ]; then
+        sz=$(wc -c <"$AUDIT_LOG" 2>/dev/null)
+        if [ -n "$sz" ] && [ "$sz" -gt "$AUDIT_MAX_BYTES" ] 2>/dev/null; then
+            { tail -c "$((AUDIT_MAX_BYTES / 2))" "$AUDIT_LOG" >"$AUDIT_LOG.trim" \
+                && mv -f "$AUDIT_LOG.trim" "$AUDIT_LOG"; } 2>/dev/null
+        fi
+    fi
+    # 错误重定向必须包住整个复合命令：日志路径不可写时，报错来自 shell 建立重定向的
+    # 那一刻，挂在 printf 上的 2>/dev/null 拦不住，会直接漏到用户终端上。
+    { printf '%s [%s] %s\n' "$ts" "${SUDO_USER:-root}" "$*" >>"$AUDIT_LOG"; } 2>/dev/null
+    return 0
+}
+
+# ----------------------------- 单实例锁 -------------------------------------
+# 两个终端同时跑本脚本改同一个站点会竞态：A 读 meta → B 改写 → A 用旧 meta 重渲染，
+# B 的改动被静默吞掉。用 flock 独占，第二个实例直接拒绝。
+# 无 flock（极简系统）时不阻断，只提醒——锁是防呆，不该成为可用性的单点。
+acquire_lock() {
+    command -v flock >/dev/null 2>&1 || { warn "未找到 flock，跳过单实例保护（请勿同时开两个窗口操作）。"; return 0; }
+    mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null
+    exec 9>"$LOCK_FILE" 2>/dev/null || { warn "无法创建锁文件 $LOCK_FILE，跳过单实例保护。"; return 0; }
+    if ! flock -n 9; then
+        err "已有另一个 nginx-rp 实例正在运行（锁：$LOCK_FILE）。"
+        err "同时操作会造成配置竞态，请等它退出后再试。"
+        exit 1
+    fi
+    return 0
+}
+
+# 清理本进程留下的中途产物：渲染临时文件与回滚快照都带 .$$ 后缀，Ctrl-C / 断连时
+# 会残留。站点列表虽然会跳过这类文件，但不清理就永久堆在 sites-available 里。
+cleanup_tmp() {
+    rm -f "$SITES_AVAIL"/*.tmp."$$" "$SITES_AVAIL"/*.rollback."$$" 2>/dev/null
+    return 0
+}
 
 # ----------------------------- 前置检查 -------------------------------------
 require_root() {
@@ -146,6 +217,7 @@ self_update() {
     fi
     if cp -f "$tmp" "$INSTALL_PATH" 2>/dev/null && chmod +x "$INSTALL_PATH"; then
         rm -f "$tmp"
+        audit "SELF-UPDATE ok -> $INSTALL_PATH"
         ok "已更新到最新版，正在重启脚本..."; sleep 1
         exec bash "$INSTALL_PATH"
     else
@@ -153,16 +225,27 @@ self_update() {
     fi
 }
 
+# 统一的配置测试入口。错误输出收到 mktemp 临时文件，绝不用 /tmp 下的固定文件名：
+# /tmp 是所有用户可写的，可预测的路径能被本地非特权用户预先做成指向 /etc/shadow 之类的
+# 软链，root 运行时重定向会跟随软链覆盖目标文件（CWE-59）。
+nginx_test() {
+    local log rc
+    log="$(mktemp 2>/dev/null)" || { err "无法创建临时文件，配置测试中止。"; return 1; }
+    nginx -t 2>"$log"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        err "Nginx 配置测试失败。错误如下："
+        cat "$log"
+    fi
+    rm -f "$log"
+    return "$rc"
+}
+
 # 重载 nginx：兼容三种情况——① systemd 托管；② 手动/其它方式起的「野」nginx；
 # ③ 当前没运行。不依赖 /run/nginx.pid（野进程常常没写它，导致 nginx -s reload
 # 报 invalid PID），而是直接定位正在运行的 master 进程发 HUP 重载（零停机）。
 reload_nginx() {
     neutralize_conf_gzip   # 每次 reload 前兜底：清掉 nginx.conf 默认 gzip，防止与公共配置重复声明
-    if ! nginx -t 2>/tmp/nginx_test.log; then
-        err "Nginx 配置测试失败，未重载。错误如下："
-        cat /tmp/nginx_test.log
-        return 1
-    fi
+    nginx_test || { err "未重载。"; return 1; }
 
     # 找到正在运行的 master（pid 文件优先，陈旧则回退到进程扫描）
     local mpid
@@ -196,9 +279,7 @@ reload_nginx() {
 # worker 一起清掉。非 systemd 环境回退到 stop + 清残留 + start。
 restart_nginx() {
     neutralize_conf_gzip   # 同 reload：重启前兜底清掉 nginx.conf 默认 gzip，避免重复声明
-    if ! nginx -t 2>/tmp/nginx_test.log; then
-        err "Nginx 配置测试失败，未重启。错误如下："; cat /tmp/nginx_test.log; return 1
-    fi
+    nginx_test || { err "未重启。"; return 1; }
     if systemctl restart nginx 2>/dev/null; then
         ok "Nginx 已重启（systemd）"; return 0
     fi
@@ -242,13 +323,62 @@ _iptables_block_chains() {
     echo INPUT
 }
 
-# 任一链已存在 DROP 规则即视为已封锁
+# 必须【所有】相关链都有 DROP 规则才算真正封锁。
+# 此前是「任一链有即算已封」：Docker 重启会重建 DOCKER-USER 链、把规则清掉，而 INPUT
+# 链的还在，于是菜单显示「已封锁」，但 Docker 发布的端口实际早已能公网直连——
+# 一个只在状态显示上撒谎、后果却是端口裸奔的判断。
 backend_port_blocked() {
     local port="$1" ch
     for ch in $(_iptables_block_chains); do
-        iptables -C "$ch" -p tcp --dport "$port" ! -i lo -j DROP 2>/dev/null && return 0
+        iptables -C "$ch" -p tcp --dport "$port" ! -i lo -j DROP 2>/dev/null || return 1
     done
-    return 1
+    return 0
+}
+
+# 已封锁端口的状态记录（一行一个端口），供开机/Docker 重启后自愈重放
+_remember_blocked_port() {
+    mkdir -p "$(dirname "$BLOCKED_PORTS_FILE")" 2>/dev/null
+    grep -qxF "$1" "$BLOCKED_PORTS_FILE" 2>/dev/null && return 0
+    { echo "$1" >>"$BLOCKED_PORTS_FILE"; } 2>/dev/null
+    return 0
+}
+
+_forget_blocked_port() {
+    local tmp
+    [ -f "$BLOCKED_PORTS_FILE" ] || return 0
+    tmp="$(mktemp 2>/dev/null)" || return 0
+    if grep -vxF "$1" "$BLOCKED_PORTS_FILE" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$BLOCKED_PORTS_FILE" 2>/dev/null || rm -f "$tmp"
+    else
+        rm -f "$tmp"   # grep 无匹配行时返回 1，此时文件只剩这一个端口，直接清空
+        : > "$BLOCKED_PORTS_FILE" 2>/dev/null
+    fi
+    return 0
+}
+
+# 重放端口封锁规则（脚本启动时调用）。
+# 为什么需要：Docker 每次重启都会重建 DOCKER-USER 链，把插在里面的 DROP 规则一起清掉；
+# 主机重启后若没装 netfilter-persistent，INPUT 链的规则同样会丢。表现是「明明封了端口，
+# 过一阵又能公网直连了」，而且全程没有任何提示。逐链检查、缺哪条补哪条。
+restore_port_blocks() {
+    [ -f "$BLOCKED_PORTS_FILE" ] || return 0
+    command -v iptables >/dev/null 2>&1 || return 0
+    local port ch restored=0 missing
+    while IFS= read -r port; do
+        case "$port" in ''|*[!0-9]*) continue ;; esac
+        missing=0
+        for ch in $(_iptables_block_chains); do
+            iptables -C "$ch" -p tcp --dport "$port" ! -i lo -j DROP 2>/dev/null && continue
+            iptables -I "$ch" 1 -p tcp --dport "$port" ! -i lo -j DROP 2>/dev/null && missing=1
+        done
+        [ "$missing" = 1 ] && restored=$((restored + 1))
+    done < "$BLOCKED_PORTS_FILE"
+    if [ "$restored" -gt 0 ]; then
+        warn "已重放 $restored 个端口的直连封锁规则（Docker 或主机重启会清掉它们）。"
+        audit "RESTORE-PORT-BLOCKS count=$restored"
+        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+    fi
+    return 0
 }
 
 restrict_port() {
@@ -260,7 +390,10 @@ restrict_port() {
             iptables -I "$ch" 1 -p tcp --dport "$port" ! -i lo -j DROP
     done
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+    _remember_blocked_port "$port"
+    audit "BLOCK-PORT $port"
     ok "已封锁公网直连 :$port（保留本机回环，Nginx 反代不受影响）"
+    info "已记入 $BLOCKED_PORTS_FILE：Docker/主机重启会清掉 iptables 规则，下次运行本脚本会自动补回。"
     warn "云厂商安全组/安全列表（Oracle / 阿里云等）需另在控制台收紧，本脚本只改本机 iptables。"
 }
 
@@ -273,6 +406,8 @@ unrestrict_port() {
         done
     done
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+    _forget_blocked_port "$port"   # 从自愈清单里移除，否则下次启动又被重放回来
+    audit "UNBLOCK-PORT $port"
     ok "已解除端口 $port 的公网直连封锁"
 }
 
@@ -302,12 +437,26 @@ restrict_backend_port() {
 # HTTP 直接 444、HTTPS 拒绝握手。真实站点都带 server_name，只有 IP/未知域名会落到这里。
 deny_ip_enabled() { [ -f "$DENY_IP_CONF" ]; }
 
-# nginx >= 1.19.4 才有 ssl_reject_handshake（可不带证书直接拒绝未知 SNI）
-nginx_supports_reject_handshake() {
-    local v
-    v=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    [ -n "$v" ] && [ "$(printf '%s\n1.19.4\n' "$v" | sort -V | head -1)" = "1.19.4" ]
+# 取本机 nginx 版本号（x.y.z），取不到则为空
+nginx_version() {
+    nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
 }
+
+# 判断本机 nginx 版本是否 >= 指定版本
+nginx_version_ge() {
+    local want="$1" v; v=$(nginx_version)
+    [ -n "$v" ] && [ "$(printf '%s\n%s\n' "$v" "$want" | sort -V | head -1)" = "$want" ]
+}
+
+# nginx >= 1.19.4 才有 ssl_reject_handshake（可不带证书直接拒绝未知 SNI）
+nginx_supports_reject_handshake() { nginx_version_ge 1.19.4; }
+
+# 独立的 `http2 on;` 指令是 nginx 1.25.1 才引入的；更早版本只能写 `listen ... http2`。
+# 这不是「推荐版本」而是硬依赖：Debian 12(bookworm) 官方源的 nginx 是 1.22.1，
+# 在它上面渲染出 `http2 on;` 会让 nginx -t 直接报 unknown directive，
+# 于是【所有 HTTPS 站点全部建不起来】。反过来，新版对 `listen ... http2` 只是弃用警告
+# 仍可工作，所以版本探测失败时按老语法走，是安全的默认。
+nginx_supports_http2_directive() { nginx_version_ge 1.25.1; }
 
 # 老版本 nginx 回落：生成一张自签证书占位（只给兜底 server 用，真实域名各走各的证书）
 ensure_snakeoil_cert() {
@@ -359,9 +508,11 @@ enable_deny_ip() {
 
     if restart_nginx; then
         ok "已开启：用 IP 直接访问将被拒绝，只有域名能打开。"
+        audit "DENY-IP enable"
     else
         err "配置测试失败，已回滚（可能与已有 default_server 冲突）。"
         rm -f "$DENY_IP_CONF"; reload_nginx
+        audit "DENY-IP enable failed, rolled back"
         return 1
     fi
 }
@@ -369,7 +520,7 @@ enable_deny_ip() {
 disable_deny_ip() {
     [ -f "$DENY_IP_CONF" ] || { info "未开启「禁止 IP 直连」"; return 0; }
     rm -f "$DENY_IP_CONF"
-    restart_nginx && ok "已关闭「禁止 IP 直连」（IP 访问恢复默认行为）。"
+    restart_nginx && { ok "已关闭「禁止 IP 直连」（IP 访问恢复默认行为）。"; audit "DENY-IP disable"; }
 }
 
 # ------------------- 真实客户端 IP 透传（real_ip） --------------------------
@@ -380,28 +531,111 @@ disable_deny_ip() {
 # IP，让日志与限流按真实访客计算。仅信任列出的上游地址，避免客户端伪造 XFF。
 realip_enabled() { [ -f "$REALIP_CONF" ]; }
 
+# 校验 IPv4（含每段 ≤255 的数值范围）。返回 0 合法 / 1 非法。
+valid_ipv4() {
+    local ip="$1" o
+    [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    local -a octets
+    IFS=. read -ra octets <<< "$ip"
+    for o in "${octets[@]}"; do
+        [ "$((10#$o))" -le 255 ] || return 1
+    done
+    return 0
+}
+
+# 校验 IPv6，支持 :: 压缩与末尾 IPv4 映射（如 ::ffff:192.0.2.1）。返回 0 合法 / 1 非法。
+# 规则：字符集合法、:: 至多出现一次、单段长度 ≤4、IPv4 映射只能是整个地址的最后一段、
+# 段数在「有压缩 ≤7」与「无压缩 ==8」两种形态下分别校验。
+# 早先的实现只查「含冒号且字符都是十六进制」，`:::::::` 这类畸形串会被放行并写进 nginx。
+valid_ipv6() {
+    local ip="$1" head tail seg which side n=0 compressed=0
+    local -a segs
+
+    [ -n "$ip" ] || return 1
+    case "$ip" in
+        *[!0-9A-Fa-f:.]*) return 1 ;;   # 非法字符
+        *:::*)            return 1 ;;   # ::: 及以上一定非法
+        *:*)              ;;            # 必须含冒号
+        *)                return 1 ;;
+    esac
+
+    case "$ip" in
+        *::*)
+            compressed=1
+            head="${ip%%::*}"
+            tail="${ip#*::}"
+            case "$tail" in *::*) return 1 ;; esac      # 第二个 :: 非法
+            ;;
+        *)
+            head="$ip"; tail=""
+            case "$ip" in :*|*:) return 1 ;; esac       # 无压缩时不能以单冒号起始/收尾
+            ;;
+    esac
+
+    for which in head tail; do
+        [ "$which" = head ] && side="$head" || side="$tail"
+        [ -n "$side" ] || continue
+        case "$side" in :*|*:) return 1 ;; esac         # 单侧不应残留孤立冒号
+        IFS=: read -ra segs <<< "$side"
+        for seg in "${segs[@]}"; do
+            [ -n "$seg" ] || return 1
+            case "$seg" in
+                *.*)
+                    # IPv4 映射必须落在整个地址的最后一段
+                    [ "$compressed" = 1 ] && [ "$which" != tail ] && return 1
+                    [ "$seg" = "${side##*:}" ] || return 1
+                    valid_ipv4 "$seg" || return 1
+                    n=$((n + 2)) ;;                     # 一个 IPv4 等于两个 16 位组
+                *)
+                    [ "${#seg}" -le 4 ] || return 1
+                    n=$((n + 1)) ;;
+            esac
+        done
+    done
+
+    if [ "$compressed" = 1 ]; then
+        [ "$n" -le 7 ] || return 1      # :: 至少代表一组零，显式段最多 7 组
+    else
+        [ "$n" -eq 8 ] || return 1
+    fi
+    return 0
+}
+
 # 校验 IP / CIDR（IPv4、IPv6 均可），返回 0 合法 / 1 非法。
 # 含数值范围：IPv4 每段 ≤255 且前缀 ≤32；IPv6 前缀 ≤128。
 valid_ip_cidr() {
-    local x="$1" ip pfx o
+    local x="$1" ip pfx
+    [ -n "$x" ] || return 1
     ip="${x%%/*}"
     case "$x" in */*) pfx="${x#*/}";; *) pfx="";; esac
-    if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
-        local IFS=.
-        for o in $ip; do [ "$((10#$o))" -le 255 ] || return 1; done
-        [ -n "$pfx" ] && { [[ "$pfx" =~ ^[0-9]+$ ]] && [ "$((10#$pfx))" -le 32 ] || return 1; }
-        return 0
+    case "$pfx" in */*) return 1 ;; esac        # 多个斜杠
+    if valid_ipv4 "$ip"; then
+        [ -n "$pfx" ] || return 0
+        [[ "$pfx" =~ ^[0-9]{1,2}$ ]] && [ "$((10#$pfx))" -le 32 ]
+        return $?
     fi
-    if [[ "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:]+$ ]]; then
-        [ -n "$pfx" ] && { [[ "$pfx" =~ ^[0-9]+$ ]] && [ "$((10#$pfx))" -le 128 ] || return 1; }
-        return 0
+    if valid_ipv6 "$ip"; then
+        [ -n "$pfx" ] || return 0
+        [[ "$pfx" =~ ^[0-9]{1,3}$ ]] && [ "$((10#$pfx))" -le 128 ]
+        return $?
     fi
     return 1
 }
 
+# 校验自定义登录 cookie 名 / 正则：只放行 cookie 名的合法字符与「|」多选一。
+# 它会被原样拼进 nginx 的 map 块，放行 ; { } 引号等价于允许注入任意 nginx 指令——
+# 同一个渲染函数的 allow_ips / realip 都有校验，唯独这里没有，属校验不对称。
+# 空值合法（表示用内置通用列表识别）。
+# 用 [[ =~ ]] 而非 case：case 的模式里「|」是分支分隔符，写进 [!...] 否定字符类会把
+# 模式从中间截断，导致所有非法输入被放行（已被单测抓到）。
+valid_cookie_pattern() {
+    [ -z "$1" ] && return 0
+    [[ "$1" =~ ^[A-Za-z0-9_.:|-]+$ ]]
+}
+
 enable_realip() {
     command -v nginx >/dev/null 2>&1 || { err "请先安装 Nginx（主菜单 →「安装 Nginx」）"; return 1; }
-    echo "  输入“上游可信代理”的 IP 或 CIDR（你的边缘 nginx / CDN 回源地址），多个用空格分隔。"
+    echo "  输入「上游可信代理」的 IP 或 CIDR（你的边缘 nginx / CDN 回源地址），多个用空格分隔。"
     echo "  例： 203.0.113.10 203.0.113.11 10.0.0.0/8"
     local input; read -rp "  可信代理列表: " input
     [ -z "$input" ] && { warn "未输入，已取消。"; return 1; }
@@ -426,6 +660,7 @@ enable_realip() {
 
     if restart_nginx; then
         ok "已开启 real_ip：本机日志与限流将按真实客户端 IP（X-Forwarded-For）计算。"
+        audit "GLOBAL-REALIP enable trusted=$(printf '%s' "$froms" | tr '\n' ' ')"
         # 新版站点白名单按 $realip_remote_addr(真实对端)geo 判定,与 real_ip 天然共存;
         # 但旧版脚本渲染的站点仍是 allow/deny(按被改写后的 $remote_addr 比对)→ 会 403。
         warn "注意：旧版本渲染过的「IP 白名单」站点需重新保存一次才与 real_ip 兼容"
@@ -440,7 +675,7 @@ enable_realip() {
 disable_realip() {
     [ -f "$REALIP_CONF" ] || { info "未开启 real_ip"; return 0; }
     rm -f "$REALIP_CONF"
-    restart_nginx && ok "已关闭 real_ip（恢复使用直连对端 IP）。"
+    restart_nginx && { ok "已关闭 real_ip（恢复使用直连对端 IP）。"; audit "GLOBAL-REALIP disable"; }
 }
 
 realip_menu() {
@@ -474,14 +709,9 @@ realip_menu() {
 set_site_realip() {
     local f="$1"
     [ -f "$f" ] || { err "站点文件不存在：$f"; return 1; }
-    local domain target maxbody cache ssl crt key allow_ips realip skipcookie sslverify
-    domain=$(get_meta domain "$f");   target=$(get_meta target "$f")
-    maxbody=$(get_meta maxbody "$f"); cache=$(get_meta cache "$f")
-    ssl=$(get_meta ssl "$f"); crt=$(get_meta crt "$f"); key=$(get_meta key "$f")
-    allow_ips=$(get_meta allow_ips "$f"); realip=$(get_meta realip "$f")
-    skipcookie=$(get_meta skipcookie "$f"); sslverify=$(get_meta sslverify "$f")
+    site_load "$f"
 
-    echo "  本站当前 real_ip 可信上游：${realip:-（未设置，不还原真实 IP）}"
+    echo "  本站当前 real_ip 可信上游：${SITE[realip]:-（未设置，不还原真实 IP）}"
     echo "  输入「上游可信代理」的 IP/CIDR（上游边缘 nginx / CDN 回源地址），空格分隔。"
     echo "  例： 203.0.113.10 203.0.113.11 10.0.0.0/8"
     echo "  直接回车留空 = 关闭本站 real_ip。"
@@ -499,12 +729,15 @@ set_site_realip() {
 
         # 本站白名单按 $realip_remote_addr(真实 TCP 对端)geo 判定,不受 real_ip 改写影响,
         # 两者可同站共存(锁上游 + 后端拿真实访客 IP 两不误),重新渲染即自动生效。
-        [ -n "$allow_ips" ] && info "本站已设 IP 白名单($allow_ips):按直连对端判定,与 real_ip 兼容,将一并重渲染。"
+        [ -n "${SITE[allow_ips]}" ] && info "本站已设 IP 白名单(${SITE[allow_ips]}):按直连对端判定,与 real_ip 兼容,将一并重渲染。"
     fi
 
-    if render_site_safe "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$froms" "$skipcookie" "$sslverify"; then
+    local domain="${SITE[domain]}"
+    SITE[realip]="$froms"
+    if render_site_safe; then
         if [ -n "$froms" ]; then ok "已为 $domain 开启 real_ip，可信上游：$froms"
         else ok "已关闭 $domain 的 real_ip（恢复使用直连对端 IP）。"; fi
+        audit "SITE-REALIP site=${domain%% *} value=${froms:--}"
         restart_nginx   # 安全类变更：彻底重启清掉残留旧 worker，避免旧访问规则继续生效
     else
         return 1
@@ -517,32 +750,49 @@ set_site_realip() {
 set_site_allow_ips() {
     local f="$1"
     [ -f "$f" ] || { err "站点文件不存在：$f"; return 1; }
-    local domain target maxbody cache ssl crt key allow_ips realip skipcookie sslverify
-    domain=$(get_meta domain "$f");   target=$(get_meta target "$f")
-    maxbody=$(get_meta maxbody "$f"); cache=$(get_meta cache "$f")
-    ssl=$(get_meta ssl "$f"); crt=$(get_meta crt "$f"); key=$(get_meta key "$f")
-    allow_ips=$(get_meta allow_ips "$f"); realip=$(get_meta realip "$f")
-    skipcookie=$(get_meta skipcookie "$f"); sslverify=$(get_meta sslverify "$f")
+    site_load "$f"
+    local domain="${SITE[domain]}"
 
     echo "  仅允许下列 IP/网段访问 $domain（空格分隔，支持 CIDR 如 1.2.3.0/24 或 IPv6）。"
     echo "  直接回车留空 = 清除白名单，恢复任意 IP 可访问。"
-    echo "  当前：${allow_ips:-（无，任意 IP 可访问）}"
+    echo "  当前：${SITE[allow_ips]:-（无，任意 IP 可访问）}"
     local newips; read -rp "  允许的 IP： " newips
     local -a _ips; read -ra _ips <<< "$newips"; newips="${_ips[*]}"   # 压缩多余空格
-    local bad=0 ip
+    # 逐条按 IP/CIDR 语义校验（与 real_ip 入口同一把尺子）。此前这里只查字符集合，
+    # 1.2.3. 这类残缺地址会被放行并写进 geo 块，靠 nginx -t 才兜住。
+    local ip
     for ip in $newips; do
-        case "$ip" in *[!0-9a-fA-F:./]*) bad=1 ;; esac
+        valid_ip_cidr "$ip" || { err "非法 IP/网段：$ip（支持 IPv4 / IPv6 / CIDR），已取消。"; return 1; }
     done
-    if [ "$bad" = 1 ]; then
-        err "含非法字符，IP/网段只能包含数字、字母(IPv6)、. : / ，已取消。"; return 1
-    fi
-    if render_site_safe "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$newips" "$realip" "$skipcookie" "$sslverify"; then
+    SITE[allow_ips]="$newips"
+    if render_site_safe; then
         if [ -n "$newips" ]; then
             ok "已设置白名单，仅允许：$newips（其它来源 403；按直连对端 IP 判定，与 real_ip 共存不冲突）"
         else ok "已清除白名单，恢复任意 IP 可访问。"; fi
+        audit "SITE-ALLOWIPS site=${domain%% *} value=${newips:--}"
         restart_nginx   # 安全类变更：彻底重启清掉残留旧 worker，避免旧访问规则继续生效
         return 0
     fi
+    return 1
+}
+
+# 修改 /etc/nginx/nginx.conf 之前先备份一份到 $BACKUP_DIR。
+# 本脚本会在主配置里做三件事：补 sites-enabled include、加 worker_shutdown_timeout、
+# 注释掉与公共配置重复的 gzip。这些都是对用户主配置的原地改写，没有备份就没有退路。
+# 单次运行内只备份一次（每次 reload 都会走 gzip 去重，否则备份目录会被刷爆）。
+# 备份失败返回 1，调用方据此跳过修改——宁可不改，也不在无退路的情况下动主配置。
+backup_nginx_conf() {
+    [ "$NGINX_CONF_BACKED_UP" = 1 ] && return 0
+    [ -f "$NGINX_CONF" ] || return 0
+    mkdir -p "$BACKUP_DIR" 2>/dev/null
+    local dst; dst="$BACKUP_DIR/nginx.conf.$(date +%s 2>/dev/null).$$.bak"
+    if cp -f "$NGINX_CONF" "$dst" 2>/dev/null; then
+        NGINX_CONF_BACKED_UP=1
+        info "已备份 nginx.conf → $dst（本脚本将修改主配置）"
+        audit "BACKUP nginx.conf -> $dst"
+        return 0
+    fi
+    warn "无法备份 nginx.conf 到 $BACKUP_DIR，为安全起见跳过对主配置的修改。"
     return 1
 }
 
@@ -551,13 +801,15 @@ set_site_allow_ips() {
 # 让旧配置长期残留——这正是「改了配置但旧连接仍走旧规则」的根因。注意它属于 main 上下文，
 # 不能放 conf.d（那是 http 内），所以必须改主配置文件。
 ensure_worker_shutdown_timeout() {
-    local conf=/etc/nginx/nginx.conf to="30s"
-    [ -f "$conf" ] || return 0
-    grep -qE '^[[:space:]]*worker_shutdown_timeout' "$conf" && return 0
-    if grep -qE '^[[:space:]]*events[[:space:]]*\{' "$conf"; then
+    local to="30s"
+    [ -f "$NGINX_CONF" ] || return 0
+    grep -qE '^[[:space:]]*worker_shutdown_timeout' "$NGINX_CONF" && return 0
+    if grep -qE '^[[:space:]]*events[[:space:]]*\{' "$NGINX_CONF"; then
+        backup_nginx_conf || return 1
         # 插到第一个 events{ 之前（main 上下文）
-        sed -i "0,/^[[:space:]]*events[[:space:]]*{/s//worker_shutdown_timeout $to;  # 由 nginx-rp.sh 添加：限制 reload 后旧 worker 存活上限，避免旧配置残留\n&/" "$conf"
+        sed -i "0,/^[[:space:]]*events[[:space:]]*{/s//worker_shutdown_timeout $to;  # 由 nginx-rp.sh 添加：限制 reload 后旧 worker 存活上限，避免旧配置残留\n&/" "$NGINX_CONF"
         warn "已在 nginx.conf 设置 worker_shutdown_timeout $to（reload 后旧配置最多 $to 收敛）"
+        audit "MODIFY nginx.conf: worker_shutdown_timeout=$to"
     else
         warn "nginx.conf 未找到 events 块，跳过 worker_shutdown_timeout 设置。"
     fi
@@ -565,15 +817,52 @@ ensure_worker_shutdown_timeout() {
 
 # 发行版默认 nginx.conf 的 http{} 里通常已带 gzip on;（部分还含其它 gzip_*）。
 # 本脚本的公共配置 conf.d/00-nginx-rp.conf 也在 http{} 内声明 gzip，两者同上下文重复，
-# 会让 nginx -t 报 "gzip directive is duplicate"。这里把 nginx.conf 里未注释的
-# gzip / gzip_* 行注释掉，让 conf.d 成为唯一来源（幂等：已注释的行不再处理）。
+# 会让 nginx -t 报 "gzip directive is duplicate"。这里把冲突的那些行注释掉，
+# 让 conf.d 成为唯一来源（幂等：已注释的行不再处理）。
+#
+# 只处理 http{} 的【直接子级】。早先用的是「行首匹配 gzip」的全文件正则，会把用户写在
+# server{} / location{} 里的 gzip 指令一并注释——那些是合法且有意义的局部覆盖，
+# 与公共配置并不冲突，注释掉等于静默改变站点行为。改用 awk 跟踪花括号深度精确定位。
+_GZIP_AWK='
+BEGIN { depth = 0; http_depth = -1; changed = 0 }
+{
+    line = $0
+    stripped = line
+    sub(/^[ \t]+/, "", stripped)
+    is_comment = (substr(stripped, 1, 1) == "#")
+
+    if (!is_comment && http_depth >= 0 && depth == http_depth && stripped ~ /^gzip[ \t_]/) {
+        print "# " line "  # 由 nginx-rp.sh 注释：gzip 统一在 conf.d/00-nginx-rp.conf 管理"
+        changed = 1
+    } else {
+        print line
+    }
+
+    if (!is_comment) {
+        if (http_depth < 0 && stripped ~ /^http[ \t]*\{/) http_depth = depth + 1
+        opens = gsub(/\{/, "{", line)
+        closes = gsub(/\}/, "}", line)
+        depth += opens - closes
+        if (http_depth >= 0 && depth < http_depth) http_depth = -1
+    }
+}
+END { exit (changed ? 0 : 1) }
+'
 neutralize_conf_gzip() {
-    local conf=/etc/nginx/nginx.conf
-    [ -f "$conf" ] || return 0
-    # 行首（允许前导空白）紧跟 gzip 或 gzip_ 且未被 # 注释的行才处理
-    grep -qE '^[[:space:]]*gzip([[:space:]_])' "$conf" || return 0
-    sed -i -E 's/^([[:space:]]*)(gzip([[:space:]_]).*)$/\1# \2  # 由 nginx-rp.sh 注释：gzip 统一在 conf.d\/00-nginx-rp.conf 管理/' "$conf"
-    warn "已注释 nginx.conf 内默认的 gzip 设置（改由 $GLOBAL_CONF 统一管理，避免重复声明）"
+    [ -f "$NGINX_CONF" ] || return 0
+    command -v awk >/dev/null 2>&1 || return 0
+    local tmp; tmp="$(mktemp 2>/dev/null)" || return 0
+    # awk 退出码 0 表示「确实有 http 顶层的 gzip 行被注释」，此时才动主配置
+    if awk "$_GZIP_AWK" "$NGINX_CONF" > "$tmp" 2>/dev/null; then
+        if backup_nginx_conf && cp -f "$tmp" "$NGINX_CONF" 2>/dev/null; then
+            warn "已注释 nginx.conf 内 http 顶层的 gzip 设置（改由 $GLOBAL_CONF 统一管理，避免重复声明）"
+            audit "MODIFY nginx.conf: neutralize http-level gzip"
+        else
+            warn "未能写入 nginx.conf，跳过 gzip 去重（nginx -t 可能报 gzip directive is duplicate）。"
+        fi
+    fi
+    rm -f "$tmp"
+    return 0
 }
 
 # ----------------------------- 全局配置 -------------------------------------
@@ -651,35 +940,77 @@ EOF
 # 只能逐条挑。host 里的点做转义，避免正则把别的域名一起误删。
 # $1 = 该站点的全部域名（空格分隔，即 meta 的 domain）。
 purge_site_cache() {
-    local domains="$1" host host_re n=0 file
+    local domains="$1" host re="" total n=0 file prog
     [ -d "$CACHE_DIR" ] || return 0
-    command -v grep >/dev/null 2>&1 || return 0
-    info "清理该站点缓存条目（遍历缓存目录，文件多时可能稍慢）..."
+    [ -n "$domains" ] || return 0
+    command -v awk >/dev/null 2>&1 || { warn "未找到 awk，跳过缓存清理。"; return 0; }
+
+    # 一个正则覆盖该站点全部域名。host 里的点必须转义，否则 a.b.com 的正则会连
+    # aXbYcom 一类别的域名条目一起误删。KEY 形如 httpexample.com/... （scheme 直接接 host）
     for host in $domains; do
-        host_re="${host//./\\.}"                     # example.com -> example\.com
-        # KEY 形如 httpexample.com/...　或　httpsexample.com/...（scheme 直接接 host 接 /路径）
-        while IFS= read -r file; do
-            [ -n "$file" ] && rm -f "$file" && n=$((n+1))
-        done < <(grep -rlsE "KEY: https?${host_re}/" "$CACHE_DIR" 2>/dev/null)
+        [ -n "$re" ] && re+="|"
+        re+="${host//./\\.}"
     done
-    if [ "$n" -gt 0 ]; then ok "已清理该站点缓存条目 $n 个"
-    else info "该站点无缓存条目（未开缓存或缓存已空）"; fi
+    re="^KEY: https?(${re})/"
+
+    total=$(find "$CACHE_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${total:-0}" -eq 0 ]; then
+        info "该站点无缓存条目（缓存目录为空）"
+        return 0
+    fi
+
+    # 只读每个缓存文件的头部。KEY 就在文件开头，而缓存区上限是 10GB——此前用
+    # grep -rl 全文匹配，未命中的文件会被整个读到尾，删一次站点等于全盘扫描十几 GB，
+    # 分钟级阻塞且全程没有任何提示。nextfile 让 awk 命中或读满 16 行立刻跳下一个文件。
+    info "扫描缓存目录（$total 个文件，只读文件头）..."
+    prog='FNR > 16 { nextfile } $0 ~ re { print FILENAME; nextfile }'
+    if ! echo | awk '{ nextfile }' >/dev/null 2>&1; then
+        # 极老的 awk 没有 nextfile：退回全文匹配，功能正确但慢，如实告知而不是假装很快
+        warn "当前 awk 不支持 nextfile，退回全文扫描，缓存目录较大时会明显变慢。"
+        prog='$0 ~ re { print FILENAME }'
+    fi
+
+    # 正则经环境变量传入而非 awk -v：-v 会对值做转义序列处理，把 \. 降级成 .（匹配任意
+    # 字符），白白扩大删除范围。ENVIRON 取值不做任何转义。
+    #
+    # 并行扫描：耗时几乎全在「为每个文件 open/read/close」的 IO 延迟上，不是 CPU。
+    # 单进程串行时 CPU 大部分时间在等盘，-P 让多个 awk 同时压在 IO 队列上。
+    # 每行只输出一个路径且远短于 PIPE_BUF(4096)，写入是原子的，多进程并发写同一管道
+    # 不会串行交错成半行。
+    local jobs; jobs=$(nproc 2>/dev/null || echo 4)
+    [ "$jobs" -gt 8 ] 2>/dev/null && jobs=8   # 再多就只是加剧盘的随机读争抢
+    while IFS= read -r file; do
+        [ -n "$file" ] && rm -f "$file" && n=$((n+1))
+    done < <(find "$CACHE_DIR" -type f -print0 2>/dev/null \
+             | RP_KEY_RE="$re" xargs -0 -r -P "$jobs" -n 400 \
+               awk 'BEGIN { re = ENVIRON["RP_KEY_RE"] } '"$prog" 2>/dev/null)
+
+    if [ "$n" -gt 0 ]; then
+        ok "已清理该站点缓存条目 $n 个"
+        audit "PURGE-CACHE domains=$domains removed=$n"
+    else
+        info "该站点无缓存条目（未开缓存或缓存已空）"
+    fi
 }
 
 # 确保 nginx.conf 引入 sites-enabled（部分精简/第三方安装默认只用 conf.d）。
 # 安装、以及把外部反代导入为受管站点（落在 sites-available + sites-enabled 软链）时都要先确保它，
 # 否则受管站点不会被加载、而 nginx -t 仍通过 → reload「假成功」但站点其实没生效。
 ensure_sites_enabled_include() {
-    grep -qE "include\s+/etc/nginx/sites-enabled/\*" /etc/nginx/nginx.conf 2>/dev/null && return 0
-    if grep -qE "include\s+/etc/nginx/conf\.d/\*\.conf;" /etc/nginx/nginx.conf 2>/dev/null; then
-        sed -i '/include \/etc\/nginx\/conf.d\/\*.conf;/a \    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf
+    grep -qE "include\s+/etc/nginx/sites-enabled/\*" "$NGINX_CONF" 2>/dev/null && return 0
+    if grep -qE "include\s+/etc/nginx/conf\.d/\*\.conf;" "$NGINX_CONF" 2>/dev/null; then
+        backup_nginx_conf || return 1
+        sed -i '/include \/etc\/nginx\/conf.d\/\*.conf;/a \    include /etc/nginx/sites-enabled/*;' "$NGINX_CONF"
         warn "已向 nginx.conf 补充 sites-enabled 引入"
+        audit "MODIFY nginx.conf: add sites-enabled include"
         return 0
     fi
     # 兜底：插到第一个 http { 之后
-    if grep -qE '^[[:space:]]*http[[:space:]]*\{' /etc/nginx/nginx.conf 2>/dev/null; then
-        sed -i '0,/http[[:space:]]*{/s//&\n    include \/etc\/nginx\/sites-enabled\/*;/' /etc/nginx/nginx.conf
+    if grep -qE '^[[:space:]]*http[[:space:]]*\{' "$NGINX_CONF" 2>/dev/null; then
+        backup_nginx_conf || return 1
+        sed -i '0,/http[[:space:]]*{/s//&\n    include \/etc\/nginx\/sites-enabled\/*;/' "$NGINX_CONF"
         warn "已向 nginx.conf 的 http 块补充 sites-enabled 引入"
+        audit "MODIFY nginx.conf: add sites-enabled include (http block)"
         return 0
     fi
     warn "无法自动确认 nginx.conf 是否引入 sites-enabled，请手动确认。"
@@ -713,6 +1044,7 @@ install_nginx() {
         reload_nginx
     fi
     ok "Nginx 就绪"
+    audit "INSTALL nginx: $(nginx -v 2>&1 | tr -d '\n')"
     pause
 }
 
@@ -737,6 +1069,7 @@ update_nginx() {
         reload_nginx
     else
         ok "Nginx 已升级：${old:-?} -> ${new:-?}"
+        audit "UPDATE nginx: ${old:-?} -> ${new:-?}"
         info "升级后重启 nginx 让新二进制生效（reload 不换二进制，且会残留旧 worker）..."
         restart_nginx
     fi
@@ -843,7 +1176,8 @@ purge_acme_residual() {
 # --force 重试一次覆盖，其它错误照常返回，不无脑 --force（避免有效证书被无谓重签、触碰 LE 限额）。
 acme_issue() {
     local log rc
-    log="$(mktemp 2>/dev/null || echo "/tmp/acme_issue.$$")"
+    # 同 nginx_test：不用 /tmp 下的可预测路径兜底（PID 可枚举，同样能被预置软链劫持）
+    log="$(mktemp 2>/dev/null)" || { err "无法创建临时文件，签发中止。"; return 1; }
     "$ACME" --issue "$@" --keylength ec-256 --server letsencrypt 2>&1 | tee "$log"
     rc=${PIPESTATUS[0]}
     if [ "$rc" -ne 0 ] && grep -q "Domain key exists" "$log"; then
@@ -912,14 +1246,30 @@ install_cert_to_nginx() {
     # nginx master 以 root 读证书,不影响 worker。
     chmod 600 "$CERT_DIR/$primary/key.pem" 2>/dev/null
     chmod 644 "$CERT_DIR/$primary/fullchain.pem" 2>/dev/null
+    audit "CERT-INSTALL domain=$primary -> $CERT_DIR/$primary"
 }
 
 # ----------------------------- 渲染站点配置 ---------------------------------
-# 参数: domain target maxbody(MB) cache(none|static|normal|micro[:秒]|slice) ssl(none|le|dns|file) crt key
-#       allow_ips realip skipcookie(自定义登录 cookie 名/正则，normal/micro/slice 档用，可空)
-#       sslverify(on=校验 https 回源的源站证书,防回源被中间人;源站自签/IP 回源留空)
+# 输入：全局关联数组 SITE（见「站点属性契约」）。调用前先 site_load / site_reset 填好。
+#   domain     多个域名用空格分隔（SAN），第一个为主域名
+#   target     反代目标 http(s)://host[:port][/path]
+#   maxbody    client_max_body_size，单位 MB
+#   cache      none | static | normal | micro[:秒] | slice
+#   ssl        none | le | dns | file；crt / key 为证书路径
+#   allow_ips  IP 白名单（空格分隔，空=不限制）
+#   realip     real_ip 可信上游（空格分隔，空=不还原）
+#   skipcookie 自定义登录 cookie 名/正则（normal/micro/slice 档用，空=用内置列表）
+#   sslverify  on=校验 https 回源的源站证书；源站自签/IP 回源留空
+# 返回：0=已落盘并启用；1=校验不过或写盘失败（此时不保证文件状态，由调用方回滚）
 render_site_file() {
-    local domain="$1" target="$2" maxbody="$3" cache="$4" ssl="$5" crt="$6" key="$7" allow_ips="$8" realip="$9" skipcookie="${10}" sslverify="${11}"
+    site_validate || return 1
+
+    local domain="${SITE[domain]}"     target="${SITE[target]}"
+    local maxbody="${SITE[maxbody]}"   cache="${SITE[cache]}"
+    local ssl="${SITE[ssl]}"           crt="${SITE[crt]}"        key="${SITE[key]}"
+    local allow_ips="${SITE[allow_ips]}" realip="${SITE[realip]}"
+    local skipcookie="${SITE[skipcookie]}" sslverify="${SITE[sslverify]}"
+
     # domain 可含多个空格分隔域名（SAN）。主域名(第一个)用作文件名/软链/证书目录的唯一标识；
     # server_name 与 meta 写全部域名。
     local primary="${domain%% *}"
@@ -969,7 +1319,18 @@ render_site_file() {
     server $up_hostport;
     keepalive 32;
 }"
-    local logname="/var/log/nginx/${primary}_access.log"
+    local logname="$LOG_DIR/${primary}_access.log"
+
+    # HTTPS 监听行：按 nginx 版本选择 http2 的写法（见 nginx_supports_http2_directive）
+    local listen_443
+    if nginx_supports_http2_directive; then
+        listen_443="    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;"
+    else
+        listen_443="    listen 443 ssl http2;
+    listen [::]:443 ssl http2;"
+    fi
 
     # IP 访问白名单：仅允许 allow_ips 里的 IP/网段访问 location /（其余 403），
     # 用途：回源域名只放行边缘 Nginx 的出口 IP。
@@ -1099,8 +1460,10 @@ map \$http_cookie \$${up_name}_sess {
     # 避免「先 > 写元信息、再 >> 追加 server 块」中途被打断（Ctrl-C/断连/信号）
     # 留下只有注释、没有 server 块的半截文件（会导致站点失效且从列表消失）。
     local tmp="$file.tmp.$$"
+    mkdir -p "$SITES_AVAIL" "$SITES_ENABLED" 2>/dev/null
     {
         echo "# ===== nginx-rp BEGIN ====="
+        echo "# metaver=$META_VERSION"
         echo "# domain=$domain"
         echo "# target=$target"
         echo "# maxbody=$maxbody"
@@ -1113,10 +1476,10 @@ map \$http_cookie \$${up_name}_sess {
         echo "# allow_ips=$allow_ips"
         echo "# realip=$realip"
         echo "# ===== nginx-rp END ====="
-    } > "$tmp"
+    } > "$tmp" || { err "写入站点元信息失败：$tmp（目录只读或磁盘已满？）"; rm -f "$tmp"; return 1; }
 
     if [ "$ssl" = "none" ]; then
-        cat >> "$tmp" <<EOF
+        cat >> "$tmp" <<EOF || { err "写入站点配置失败：$tmp（目录只读或磁盘已满？）"; rm -f "$tmp"; return 1; }
 
 $upstream_block
 $allow_geo_block$session_map_block
@@ -1149,7 +1512,7 @@ $cache_block
 }
 EOF
     else
-        cat >> "$tmp" <<EOF
+        cat >> "$tmp" <<EOF || { err "写入站点配置失败：$tmp（目录只读或磁盘已满？）"; rm -f "$tmp"; return 1; }
 
 $upstream_block
 $allow_geo_block$session_map_block
@@ -1166,9 +1529,7 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+$listen_443
     server_name $domain;
     access_log $logname;
 
@@ -1204,23 +1565,46 @@ $cache_block
 EOF
     fi
 
-    mv -f "$tmp" "$file"
-    ln -sf "$file" "$SITES_ENABLED/$primary.conf"
+    # 原子换位 + 启用。两步都必须检查返回值：此前直接裸写、不看结果，磁盘满或目录只读时
+    # 新配置根本没落盘，而调用方照常 reload——nginx -t 拿旧配置通过，于是打印「已更新」。
+    # 用户被告知改动生效，实际什么都没发生。这是最需要根除的一类失败。
+    if ! mv -f "$tmp" "$file"; then
+        err "站点配置落盘失败：$file（目录只读或磁盘已满？）"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! ln -sf "$file" "$SITES_ENABLED/$primary.conf"; then
+        err "创建 sites-enabled 软链失败：$SITES_ENABLED/$primary.conf"
+        return 1
+    fi
+    return 0
 }
 
-# 渲染站点并 reload；若 nginx -t 失败，回滚到渲染前状态（旧文件内容 / 软链），返回 1。
-# 参数与 render_site_file 完全一致。用它替代「render_site_file + reload/restart」裸写：
-# 否则测试不过时，那份损坏且已 enabled 的 .conf 会留在原地，把后续每次 reload 一起带崩。
+# 回滚到渲染前状态。渲染失败与配置测试失败两条路径共用。
+# 参数: <file> <link> <bak> <had_file(0|1)> <had_link(0|1)>
+_rollback_site() {
+    local file="$1" link="$2" bak="$3" had_file="$4" had_link="$5"
+    if [ "$had_file" = 1 ]; then mv -f "$bak" "$file" 2>/dev/null
+    else                         rm -f "$file" 2>/dev/null; fi
+    if [ "$had_link" = 1 ]; then ln -sf "$file" "$link" 2>/dev/null
+    else                         rm -f "$link" 2>/dev/null; fi
+    reload_nginx >/dev/null 2>&1
+}
+
+# 按 SITE 渲染站点并 reload；渲染失败或 nginx -t 失败都回滚到操作前状态，返回 1。
+# 用它替代「render_site_file + reload/restart」裸写：否则测试不过时，那份损坏且已
+# enabled 的 .conf 会留在原地，把后续每次 reload 一起带崩。
 render_site_safe() {
-    local domain="$1"
-    local primary="${domain%% *}"
+    local primary="${SITE[domain]%% *}"
     local file="$SITES_AVAIL/$primary.conf"
     local link="$SITES_ENABLED/$primary.conf"
 
-    # 渲染前快照：旧文件内容 + 软链是否已存在
+    # 渲染前快照：旧文件内容 + 软链是否已存在。
+    # 快照失败必须立刻中止——没有快照就没有回滚能力，此时继续渲染等于走钢丝。
     local had_file=0 had_link=0 bak=""
     if [ -f "$file" ]; then
-        had_file=1; bak="$file.rollback.$$"; cp -f "$file" "$bak" 2>/dev/null
+        had_file=1; bak="$file.rollback.$$"
+        cp -f "$file" "$bak" || { err "无法创建回滚快照（$bak），已中止，未改动任何配置。"; return 1; }
     fi
     if [ -L "$link" ] || [ -e "$link" ]; then had_link=1; fi
 
@@ -1228,20 +1612,23 @@ render_site_safe() {
     # 老机器的全局配置可能还没有这些定义 → 渲染必定 nginx -t 失败。缺了就补写（幂等）。
     grep -q 'rp_not_static' "$GLOBAL_CONF" 2>/dev/null || ensure_global_conf
 
-    render_site_file "$@"
+    if ! render_site_file; then
+        err "站点配置渲染失败，已回滚到修改前状态。"
+        _rollback_site "$file" "$link" "$bak" "$had_file" "$had_link"
+        audit "RENDER-FAIL site=$primary target=${SITE[target]}"
+        return 1
+    fi
 
     if reload_nginx; then
         [ -n "$bak" ] && rm -f "$bak"
+        audit "RENDER ok site=$primary target=${SITE[target]} cache=${SITE[cache]} ssl=${SITE[ssl]} allow_ips=${SITE[allow_ips]:--} realip=${SITE[realip]:--}"
         return 0
     fi
 
     # 测试不过 → 回滚，保证 nginx 仍跑在干净配置上
     err "配置测试未通过，已回滚到修改前状态。"
-    if [ "$had_file" = 1 ]; then mv -f "$bak" "$file" 2>/dev/null
-    else                         rm -f "$file" 2>/dev/null; fi
-    if [ "$had_link" = 1 ]; then ln -sf "$file" "$link" 2>/dev/null
-    else                         rm -f "$link" 2>/dev/null; fi
-    reload_nginx >/dev/null 2>&1
+    _rollback_site "$file" "$link" "$bak" "$had_file" "$had_link"
+    audit "RENDER-ROLLBACK site=$primary (nginx -t failed)"
     return 1
 }
 
@@ -1255,8 +1642,22 @@ normalize_target() {
         '')    return 1 ;;
         *)     t="http://$t" ;;     # 漏写 scheme：默认补 http://
     esac
-    local hostpart="${t#*://}"; hostpart="${hostpart%%/*}"
+    local rest hostpart pathpart
+    rest="${t#*://}"
+    hostpart="${rest%%/*}"
+    case "$rest" in */*) pathpart="/${rest#*/}";; *) pathpart="";; esac
     [ -z "$hostpart" ] && return 1  # 形如 http:// 没有主机部分
+
+    # host[:port] 会被原样拼进 upstream 的 server 指令，path 会拼进 proxy_pass。
+    # 放行 ; { } 空白等于允许把任意 nginx 指令注入站点配置——同函数的 allow_ips /
+    # realip 都有字符校验，这里此前完全没有，属校验不对称。
+    # 只接受「域名/IPv4 形式 + 可选端口」或「[IPv6] + 可选端口」。
+    printf '%s' "$hostpart" \
+        | grep -qE '^([A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$' \
+        || return 1
+    case "$pathpart" in
+        *';'*|*'{'*|*'}'*|*'"'*|*"'"*|*'\'*|*' '*|*$'\t'*|*$'\n'*|*$'\r'*) return 1 ;;
+    esac
     printf '%s' "$t"
 }
 
@@ -1268,6 +1669,59 @@ valid_domain() {
 # ----------------------------- 元信息读取 -----------------------------------
 get_meta() {  # get_meta <key> <file>
     grep -m1 "^# $1=" "$2" 2>/dev/null | cut -d= -f2-
+}
+
+# ----------------------------- 站点属性契约 ---------------------------------
+# 站点的全部可配置属性集中在关联数组 SITE，作为渲染的唯一输入。
+# 此前是 11 个位置参数贯穿 10 处调用点：加一个字段要同步改 10 行，漏一处、错一位都
+# 不会报错，只会静默渲染出错误配置。改成具名字段后，新增属性只需动 site_reset 与
+# render_site_file 两处。
+#
+# 落盘格式（站点 .conf 头部的 "# key=value" 注释块）刻意保持不变——存量机器上的站点
+# 无需任何迁移动作即可继续被读取和管理。metaver 采用惰性升级：旧文件读出来是空(=v1)，
+# 下次保存时自动写上当前版本，不做一次性全量重写。
+META_VERSION=2
+declare -A SITE
+
+site_reset() {
+    SITE=(
+        [domain]=""     [target]=""     [maxbody]="1024" [cache]="none"
+        [skipcookie]="" [sslverify]=""  [ssl]="none"     [crt]=""
+        [key]=""        [allow_ips]=""  [realip]=""      [metaver]=""
+    )
+}
+
+# 从站点文件载入属性。缺字段一律沿用默认值——旧版脚本写的 meta 没有 skipcookie /
+# sslverify / metaver，必须能照常读出继续用，这正是「存量零操作」的落点。
+site_load() {
+    local f="$1" k v
+    site_reset
+    for k in "${!SITE[@]}"; do
+        v=$(get_meta "$k" "$f")
+        [ -n "$v" ] && SITE["$k"]="$v"
+    done
+}
+
+# 渲染前的统一校验：meta 可能被手工编辑坏，也可能来自外部配置导入的解析结果。
+# 所有会被拼进 nginx 配置的字段都在这里过一遍，宁可拒绝渲染也不写出可疑配置。
+site_validate() {
+    local d v
+    [ -n "${SITE[domain]}" ] || { err "站点域名为空，拒绝渲染。"; return 1; }
+    for d in ${SITE[domain]}; do
+        valid_domain "$d" || { err "站点元信息里的域名非法，拒绝渲染：$d"; return 1; }
+    done
+    [ -n "${SITE[target]}" ] || { err "反代目标为空，拒绝渲染。"; return 1; }
+    normalize_target "${SITE[target]}" >/dev/null \
+        || { err "站点元信息里的反代目标非法，拒绝渲染：${SITE[target]}"; return 1; }
+    case "${SITE[maxbody]}" in
+        ''|*[!0-9]*) err "上传上限非法，拒绝渲染：${SITE[maxbody]}"; return 1 ;;
+    esac
+    valid_cookie_pattern "${SITE[skipcookie]}" \
+        || { err "站点元信息里的登录 cookie 含非法字符，拒绝渲染：${SITE[skipcookie]}"; return 1; }
+    for v in ${SITE[allow_ips]} ${SITE[realip]}; do
+        valid_ip_cidr "$v" || { err "站点元信息里的 IP/CIDR 非法，拒绝渲染：$v"; return 1; }
+    done
+    return 0
 }
 
 # ----------------------------- 缓存模式选择 ---------------------------------
@@ -1326,7 +1780,12 @@ choose_cache_mode() {
         [ "${CACHE_MODE%%:*}" = "micro" ] && \
             echo "  ⚠ 微缓存会强缓源站标记不缓存的页面，登录 cookie 识别不到=串号，务必配准。" >&2
         read -rp "  登录 cookie（留空=用内置通用列表识别）: " CACHE_SKIPCOOKIE
-        CACHE_SKIPCOOKIE="${CACHE_SKIPCOOKIE//\"/}"   # 去掉双引号，防拼进 nginx 配置串壳
+        # 白名单校验：这串会被原样拼进 nginx 的 map 块。此前只删双引号，; { } 全部放行，
+        # 等于允许把任意 nginx 指令注入站点配置（同函数的 IP 类输入都有校验，唯独这里没有）。
+        while ! valid_cookie_pattern "$CACHE_SKIPCOOKIE"; do
+            err "只能包含字母、数字与 _ . : | -（多个用 | 分隔，例：xf_user|xf_session）。"
+            read -rp "  登录 cookie（留空=用内置通用列表识别）: " CACHE_SKIPCOOKIE
+        done
         ;;
     esac
 }
@@ -1349,10 +1808,10 @@ ask_ssl_verify() {
 # ----------------------------- 选择并应用 HTTPS 证书 ------------------------
 # 弹证书方式菜单并落地（渲染站点 + reload）。新建/管理换证书共用，所以「申请失败」
 # 后进管理也能改选别的方式（HTTP-01 / DNS / 本地证书 / 仅 HTTP）。
-# 用法: apply_https_cert <domain> <target> <maxbody> <cache> [allow_ips] [realip] [skipcookie] [sslverify]
+# 输入取自全局 SITE（调用前 site_load / 填好其余字段），本函数只改 ssl / crt / key。
 # 返回: 0=已写入并启用了可用站点配置（HTTP 或 HTTPS）；1=失败/取消，未写可用配置
 apply_https_cert() {
-    local domain="$1" target="$2" maxbody="$3" cache="$4" allow_ips="$5" realip="$6" skipcookie="$7" sslverify="$8"
+    local domain="${SITE[domain]}"
     local primary="${domain%% *}"   # 多域名时证书目录按主域名
     echo "  请选择 HTTPS 证书方式："
     echo "    1) acme.sh 自动申请（HTTP-01，需 80 端口可达，推荐）"
@@ -1362,35 +1821,37 @@ apply_https_cert() {
     local s; read -rp "  输入 [1-4]（默认1）: " s
     case "$s" in
         4)
-            render_site_safe "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
-                && { ok "已设为仅 HTTP：http://$domain"; return 0; }
+            SITE[ssl]="none"; SITE[crt]=""; SITE[key]=""
+            render_site_safe && { ok "已设为仅 HTTP：http://$domain"; return 0; }
             return 1 ;;
         3)
             local crt key
             read -rp "  证书 fullchain 路径: " crt
             read -rp "  私钥 key 路径: " key
             if [ ! -f "$crt" ] || [ ! -f "$key" ]; then err "证书文件不存在"; return 1; fi
-            render_site_safe "$domain" "$target" "$maxbody" "$cache" "file" "$crt" "$key" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
-                && { ok "已启用（本地证书）：https://$domain"; return 0; }
+            SITE[ssl]="file"; SITE[crt]="$crt"; SITE[key]="$key"
+            render_site_safe && { ok "已启用（本地证书）：https://$domain"; return 0; }
             return 1 ;;
         2)
             echo "    DNS 服务商： 1) Cloudflare  2) 阿里云  3) 腾讯云(DNSPod)"
             local dp; read -rp "    选择 [1-3]: " dp
             local prov; case "$dp" in 1) prov=cloudflare;; 2) prov=aliyun;; 3) prov=tencent;; *) err "无效"; return 1;; esac
             if issue_cert_dns "$domain" "$prov" && install_cert_to_nginx "$domain"; then
-                render_site_safe "$domain" "$target" "$maxbody" "$cache" "dns" \
-                    "$CERT_DIR/$primary/fullchain.pem" "$CERT_DIR/$primary/key.pem" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
-                    && { ok "已启用（HTTPS + 泛域名证书）：https://$domain"; return 0; }
+                SITE[ssl]="dns"
+                SITE[crt]="$CERT_DIR/$primary/fullchain.pem"
+                SITE[key]="$CERT_DIR/$primary/key.pem"
+                render_site_safe && { ok "已启用（HTTPS + 泛域名证书）：https://$domain"; return 0; }
             fi
             err "证书申请或配置失败。"; return 1 ;;
         *)
             # 先建/保留 HTTP 站点承载 acme challenge，再签发，最后换成 HTTPS
-            render_site_safe "$domain" "$target" "$maxbody" "$cache" "none" "" "" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
-                || { err "初始 HTTP 配置失败"; return 1; }
+            SITE[ssl]="none"; SITE[crt]=""; SITE[key]=""
+            render_site_safe || { err "初始 HTTP 配置失败"; return 1; }
             if issue_cert_http "$domain" && install_cert_to_nginx "$domain"; then
-                render_site_safe "$domain" "$target" "$maxbody" "$cache" "le" \
-                    "$CERT_DIR/$primary/fullchain.pem" "$CERT_DIR/$primary/key.pem" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
-                    && ok "已启用（HTTPS + 自动证书）：https://$domain"
+                SITE[ssl]="le"
+                SITE[crt]="$CERT_DIR/$primary/fullchain.pem"
+                SITE[key]="$CERT_DIR/$primary/key.pem"
+                render_site_safe && ok "已启用（HTTPS + 自动证书）：https://$domain"
             else
                 err "证书申请失败，已保留仅 HTTP 站点。请检查域名解析 / 80 端口可达性，或改用 DNS API / 本地证书。"
             fi
@@ -1424,7 +1885,11 @@ configure_reverse_proxy() {
     choose_cache_mode
     ask_ssl_verify "$target"
 
-    if apply_https_cert "$domain" "$target" "$maxbody" "$CACHE_MODE" "" "" "$CACHE_SKIPCOOKIE" "$SSL_VERIFY"; then created=1; fi
+    site_reset
+    SITE[domain]="$domain";     SITE[target]="$target"
+    SITE[maxbody]="$maxbody";   SITE[cache]="$CACHE_MODE"
+    SITE[skipcookie]="$CACHE_SKIPCOOKIE"; SITE[sslverify]="$SSL_VERIFY"
+    if apply_https_cert; then created=1; fi
 
     # 反代建好后的两个收尾询问：
     if [ "$created" = 1 ]; then
@@ -1573,7 +2038,7 @@ manage_reverse_proxy() {
         c_green "===== 本机反向代理站点 ====="
         echo "（本脚本托管 + 外部发现，可改配置 / 启停 / 导入接管）"
         list_all_proxies || { pause; return; }
-        local idx; read -rp "选择要管理的站点序号（0 返回）: " idx
+        local idx; read_choice "选择要管理的站点序号（0 返回）: " idx
         { [ -z "$idx" ] || [ "$idx" = "0" ]; } && return   # 0/空回车均返回，与各菜单统一
         case "$idx" in *[!0-9]*) err "无效序号"; pause; continue ;; esac
         local n=$((10#$idx - 1))   # 10# 强制十进制，避免 08/09 被当八进制报错
@@ -1593,12 +2058,13 @@ manage_managed_site() {
     local f="$1"
     while true; do
         [ -f "$f" ] || return   # 站点文件已不存在（被删除等）→ 退出到列表
-        local domain target maxbody cache ssl crt key allow_ips realip skipcookie sslverify
-        domain=$(get_meta domain "$f"); target=$(get_meta target "$f")
-        maxbody=$(get_meta maxbody "$f"); cache=$(get_meta cache "$f")
-        ssl=$(get_meta ssl "$f"); crt=$(get_meta crt "$f"); key=$(get_meta key "$f")
-        allow_ips=$(get_meta allow_ips "$f"); realip=$(get_meta realip "$f")
-        skipcookie=$(get_meta skipcookie "$f"); sslverify=$(get_meta sslverify "$f")
+        # 每轮都重新载入：子操作（白名单 / real_ip）会改写 SITE 与磁盘上的 meta
+        site_load "$f"
+        local domain="${SITE[domain]}"     target="${SITE[target]}"
+        local maxbody="${SITE[maxbody]}"   cache="${SITE[cache]}"
+        local ssl="${SITE[ssl]}"           sslverify="${SITE[sslverify]}"
+        local skipcookie="${SITE[skipcookie]}"
+        local allow_ips="${SITE[allow_ips]}" realip="${SITE[realip]}"
         local primary="${domain%% *}"   # 多域名时的主域名（文件/软链/证书目录标识）
 
         clear
@@ -1614,7 +2080,7 @@ manage_managed_site() {
         echo "    6) 设置真实客户端 IP 透传 real_ip（本站从 XFF 还原真实访客 IP）"
         echo "    7) 修改上传体积上限（client_max_body_size，当前 ${maxbody}m）"
         echo "    0) 返回"
-        local op; read -rp "  请选择 [0-7]: " op
+        local op; read_choice "  请选择 [0-7]: " op
         case "$op" in
             1)
                 read -rp "  新目标: " target
@@ -1624,18 +2090,19 @@ manage_managed_site() {
                 [ "$nt" != "$target" ] && info "已自动补全为：$nt"
                 target="$nt"
                 ask_ssl_verify "$target"   # 目标变了,https 回源证书校验重新问(http 目标自动置空)
-                render_site_safe "$domain" "$target" "$maxbody" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$realip" "$skipcookie" "$SSL_VERIFY" \
-                    && ok "目标已更新"
+                SITE[target]="$target"; SITE[sslverify]="$SSL_VERIFY"
+                render_site_safe && ok "目标已更新"
                 ;;
             2)
                 choose_cache_mode
-                render_site_safe "$domain" "$target" "$maxbody" "$CACHE_MODE" "$ssl" "$crt" "$key" "$allow_ips" "$realip" "$CACHE_SKIPCOOKIE" "$sslverify" \
+                SITE[cache]="$CACHE_MODE"; SITE[skipcookie]="$CACHE_SKIPCOOKIE"
+                render_site_safe \
                     && { ok "缓存模式已改为 $CACHE_MODE${CACHE_SKIPCOOKIE:+（登录cookie: $CACHE_SKIPCOOKIE）}"
                          purge_site_cache "$domain"; }   # 换档后清掉旧档缓存条目，防旧策略残留继续命中
                 ;;
             3)
                 ensure_global_conf
-                apply_https_cert "$domain" "$target" "$maxbody" "$cache" "$allow_ips" "$realip" "$skipcookie" "$sslverify"
+                apply_https_cert
                 ;;
             4)
                 read -rp "  确认删除 $domain ？(y/N): " yn
@@ -1644,12 +2111,13 @@ manage_managed_site() {
                     local bak="" b; read -rp "  删除前先备份站点配置？(Y/n): " b
                     case "$b" in n|N) : ;; *) bak=$(backup_file "$f") ;; esac
                     rm -f "$f" "$SITES_ENABLED/$primary.conf"
+                    audit "SITE-DELETE site=$primary backup=${bak:--}"
                     if [ -n "$bak" ]; then restart_nginx && ok "站点已删除（备份在 $bak）"
                     else                   restart_nginx && ok "站点已删除（未备份）"; fi
                     # 清理该站点的运行产物（缓存条目 + 访问日志及其轮转），做到「像没配置过一样」。
                     # 备份(若选了)仍保留在 BACKUP_DIR，证书在下方单独询问。
                     purge_site_cache "$domain"
-                    local _alog="/var/log/nginx/${primary}_access.log"
+                    local _alog="$LOG_DIR/${primary}_access.log"
                     if [ -e "$_alog" ] || ls "$_alog."* >/dev/null 2>&1; then
                         rm -f "$_alog" "$_alog."* 2>/dev/null && info "已删除该站点访问日志（$_alog*）"
                     fi
@@ -1659,9 +2127,17 @@ manage_managed_site() {
                         local delcert
                         read -rp "  是否一并删除该域名的证书并停止自动续签？(y/N): " delcert
                         case "$delcert" in
-                            y|Y) [ -f "$ACME" ] && "$ACME" --remove -d "$primary" --ecc >/dev/null 2>&1
-                                 rm -rf "$CERT_DIR/$primary"
-                                 ok "已删除 $domain 的证书并停止自动续签" ;;
+                            y|Y)
+                                 # primary 取自 meta，meta 损坏时可能是空串——那样
+                                 # rm -rf "$CERT_DIR/" 会把整个证书目录连根删掉。
+                                 if ! valid_domain "$primary"; then
+                                     err "主域名「$primary」无效，已拒绝删除证书（避免误删整个 $CERT_DIR）。"
+                                 else
+                                     [ -f "$ACME" ] && "$ACME" --remove -d "$primary" --ecc >/dev/null 2>&1
+                                     rm -rf "${CERT_DIR:?}/${primary:?}"
+                                     audit "CERT-DELETE domain=$primary (with site)"
+                                     ok "已删除 $domain 的证书并停止自动续签"
+                                 fi ;;
                             *)   info "已保留证书于 $CERT_DIR/$primary（自动续签不变）" ;;
                         esac
                     fi
@@ -1674,8 +2150,8 @@ manage_managed_site() {
                 local nm; read -rp "  新的上传上限 MB（当前 ${maxbody}）: " nm
                 [ -z "$nm" ] && { info "未改动"; pause; continue; }
                 case "$nm" in *[!0-9]*) err "需为数字"; pause; continue ;; esac
-                render_site_safe "$domain" "$target" "$nm" "$cache" "$ssl" "$crt" "$key" "$allow_ips" "$realip" "$skipcookie" "$sslverify" \
-                    && ok "上传上限已改为 ${nm}m"
+                SITE[maxbody]="$nm"
+                render_site_safe && ok "上传上限已改为 ${nm}m"
                 ;;
             0) return ;;
             *) warn "无效选项"; sleep 1; continue ;;
@@ -1739,6 +2215,7 @@ delete_external_site() {
         [ "$(readlink -f "$e" 2>/dev/null)" = "$real" ] && rm -f "$e"
     done
     rm -f "$real"
+    audit "EXTERNAL-DELETE file=$real domain=${domain:--} backup=${bak:--}"
     if [ -n "$bak" ]; then reload_nginx && ok "已删除（备份在 $bak）"
     else                  reload_nginx && ok "已删除（未备份）"; fi
 }
@@ -1759,6 +2236,14 @@ import_external_site() {
     domain=$(_first_server_name "$real"); target=$(_first_proxy_pass "$real")
     [ -z "$domain" ] && { err "解析不到 server_name，无法导入。"; return; }
     [ -z "$target" ] && { err "解析不到 proxy_pass 目标，无法导入。"; return; }
+    # server_name 可能是正则形式（~^www\.(.+)$）或含通配符，它会被用作文件名与证书目录名，
+    # 必须先过域名格式这一关，否则会造出带正则字符的站点文件。
+    valid_domain "$domain" || {
+        err "解析出的 server_name「$domain」不是普通域名（正则/通配符形式），无法自动导入。"
+        warn "请先把该站改成普通域名，或手动迁移后再导入。"; return; }
+    local _nt; _nt=$(normalize_target "$target") || {
+        err "解析出的 proxy_pass 目标「$target」格式不受支持，无法自动导入。"; return; }
+    target="$_nt"
     # 守卫：若 proxy_pass 目标指向本配置自有的 upstream 名，模板重写会丢掉该 upstream 定义，
     # 运行时按主机名解析失败(502)，且 nginx -t 测不出来。这种情况拦下，不自动导入。
     local _ih="${target#*://}"; _ih="${_ih%%/*}"; _ih="${_ih%%:*}"; _ih="${_ih#[}"; _ih="${_ih%]}"
@@ -1775,11 +2260,25 @@ import_external_site() {
             | sed -E 's/ssl_certificate[[:space:]]+//' | head -1)
     key=$(echo "$body" | grep -oE 'ssl_certificate_key[[:space:]]+[^;]+' \
             | sed -E 's/ssl_certificate_key[[:space:]]+//' | head -1)
-    if [ -n "$crt" ] && [ -n "$key" ]; then ssl=file; else ssl=none; crt=""; key=""; fi
-    allow_ips=$(echo "$body" | grep -oE 'allow[[:space:]]+[^;]+' | sed -E 's/allow[[:space:]]+//' | sort -u | tr '\n' ' ')
-    local -a _ai; read -ra _ai <<< "$allow_ips"; allow_ips="${_ai[*]}"
-    realip=$(echo "$body" | grep -oE 'set_real_ip_from[[:space:]]+[^;]+' | sed -E 's/set_real_ip_from[[:space:]]+//' | sort -u | tr '\n' ' ')
-    local -a _ri; read -ra _ri <<< "$realip"; realip="${_ri[*]}"
+    if [ -n "$crt" ] && [ -n "$key" ]; then ssl="file"; else ssl="none"; crt=""; key=""; fi
+    # allow / set_real_ip_from 的值不一定是 IP：nginx 还支持 allow all、unix: 等形式。
+    # 模板只表达 IP/CIDR 白名单，逐条过滤掉表达不了的，并如实告诉用户丢了什么。
+    local _raw _tok _kept _dropped
+    _raw=$(echo "$body" | grep -oE 'allow[[:space:]]+[^;]+' | sed -E 's/allow[[:space:]]+//' | sort -u | tr '\n' ' ')
+    _kept=""; _dropped=""
+    for _tok in $_raw; do
+        if valid_ip_cidr "$_tok"; then _kept+="$_tok "; else _dropped+="$_tok "; fi
+    done
+    allow_ips="${_kept% }"
+    [ -n "$_dropped" ] && warn "原配置的 allow 条目「${_dropped% }」不是 IP/网段，导入后将丢弃。"
+
+    _raw=$(echo "$body" | grep -oE 'set_real_ip_from[[:space:]]+[^;]+' | sed -E 's/set_real_ip_from[[:space:]]+//' | sort -u | tr '\n' ' ')
+    _kept=""; _dropped=""
+    for _tok in $_raw; do
+        if valid_ip_cidr "$_tok"; then _kept+="$_tok "; else _dropped+="$_tok "; fi
+    done
+    realip="${_kept% }"
+    [ -n "$_dropped" ] && warn "原配置的 set_real_ip_from 条目「${_dropped% }」不是 IP/网段，导入后将丢弃。"
 
     echo "  解析结果（导入后按本脚本模板重写）："
     echo "    域名     : $domain"
@@ -1800,7 +2299,18 @@ import_external_site() {
     ensure_sites_enabled_include
     ensure_global_conf
     local managed="$SITES_AVAIL/$domain.conf"
-    render_site_file "$domain" "$target" "$maxbody" "none" "$ssl" "$crt" "$key" "$allow_ips" "$realip" "" ""
+    site_reset
+    SITE[domain]="$domain";       SITE[target]="$target"
+    SITE[maxbody]="$maxbody";     SITE[cache]="none"
+    SITE[ssl]="$ssl";             SITE[crt]="$crt";        SITE[key]="$key"
+    SITE[allow_ips]="$allow_ips"; SITE[realip]="$realip"
+    # 渲染失败要在动原文件之前就退出：此刻原配置尚未停用，直接返回即是干净现场
+    if ! render_site_file; then
+        err "生成受管配置失败，已中止。原配置未改动（备份保留：$bak）。"
+        rm -f "$managed" "$SITES_ENABLED/$domain.conf" 2>/dev/null
+        audit "IMPORT-FAIL file=$real (render failed)"
+        return
+    fi
 
     # 原文件 ≠ 受管文件 → 停用原文件，避免 server_name 重复冲突
     local disabled_old="" e
@@ -1818,6 +2328,7 @@ import_external_site() {
 
     if reload_nginx; then
         ok "已导入接管：$domain 现由本脚本管理（菜单里可改目标/缓存/证书/白名单）。"
+        audit "IMPORT ok domain=$domain from=$real backup=$bak"
         info "原配置已备份：$bak"
         case "$disabled_old" in
             *.disabled) info "原文件已停用：$disabled_old" ;;
@@ -1835,6 +2346,7 @@ import_external_site() {
             case "$real" in "$SITES_AVAIL"/*) ln -sf "$real" "$SITES_ENABLED/$(basename "$real")" ;; esac
         fi
         reload_nginx
+        audit "IMPORT-ROLLBACK domain=$domain from=$real (nginx -t failed)"
         err "已回滚到导入前状态（备份保留：$bak）。请检查原配置后重试。"
     fi
 }
@@ -1857,7 +2369,7 @@ manage_external_site() {
         echo "    3) 删除（先备份）"
         echo "    4) 导入接管为本脚本管理（可改目标/缓存/证书/IP白名单）"
         echo "    0) 返回"
-        local op; read -rp "  请选择 [0-4]: " op
+        local op; read_choice "  请选择 [0-4]: " op
         case "$op" in
             1) echo "------------------------------------------"; cat "$f"; echo "------------------------------------------" ;;
             2) toggle_external_site "$f"; pause; return ;;   # 启停可能改名文件，回列表看刷新后的状态
@@ -1882,7 +2394,7 @@ cert_menu() {
         echo "    4) 查看自动续签计划（cron）"
         echo "    5) 删除指定证书并停止续签"
         echo "    0) 返回"
-        local op; read -rp "  请选择 [0-5]: " op
+        local op; read_choice "  请选择 [0-5]: " op
         case "$op" in
             1) "$ACME" --list ;;
             2) "$ACME" --cron --force; ok "已触发强制续签" ;;
@@ -1900,12 +2412,17 @@ cert_menu() {
                 "$ACME" --list
                 local d; read -rp "  要删除证书的域名（主域名，见上方列表）: " d
                 [ -z "$d" ] && { warn "未输入域名，已取消。"; pause; continue; }
+                # 这个值会直接拼进 rm -rf 的路径：不校验的话，输入 ../.. 之类就能把
+                # 删除范围移出证书目录。
+                valid_domain "$d" || { err "「$d」不是合法域名，已取消。"; pause; continue; }
                 # 在用检查：若仍有受管站点 ssl_certificate 指向该证书目录，删文件后这些站点
                 # 下次 nginx -t 会因证书缺失失败、reload 崩。先列出并要求二次确认。
                 local inuse="" _cf
-                for _cf in $(grep -lF "$CERT_DIR/$d/" "$SITES_AVAIL"/*.conf 2>/dev/null); do
-                    inuse+="$(basename "$_cf") "
-                done
+                # 按行读而不是按词split：站点文件名理论上可含空格，按词读会把一个文件
+                # 名拆成两半，进而漏报「证书仍在使用」。
+                while IFS= read -r _cf; do
+                    [ -n "$_cf" ] && inuse+="$(basename "$_cf") "
+                done < <(grep -lF "$CERT_DIR/$d/" "$SITES_AVAIL"/*.conf 2>/dev/null)
                 if [ -n "$inuse" ]; then
                     err "以下站点仍在使用该证书：$inuse"
                     warn "删除后它们会因证书文件缺失导致 nginx 测试失败。请先给这些站点换证书或改为仅 HTTP。"
@@ -1916,7 +2433,8 @@ cert_menu() {
                 case "$yn" in
                     y|Y)
                         "$ACME" --remove -d "$d" --ecc >/dev/null 2>&1
-                        rm -rf "$CERT_DIR/$d"
+                        rm -rf "${CERT_DIR:?}/${d:?}"
+                        audit "CERT-DELETE domain=$d inuse=${inuse:--}"
                         ok "已删除 $d 的证书并从 acme.sh 移除续签登记。"
                         [ -n "$inuse" ] && warn "记得尽快给仍引用它的站点（$inuse）换证书，否则下次 reload/restart 会失败。"
                         ;;
@@ -1934,6 +2452,7 @@ cert_menu() {
 uninstall_nginx() {
     read -rp "确认卸载 Nginx？(y/N): " yn
     [ "$yn" = "y" ] || [ "$yn" = "Y" ] || return
+    audit "UNINSTALL nginx: begin"
     systemctl stop nginx 2>/dev/null
     systemctl disable nginx 2>/dev/null
     apt-get purge -y nginx nginx-common nginx-core >/dev/null 2>&1
@@ -1962,6 +2481,27 @@ uninstall_nginx() {
         esac
     fi
     warn "Nginx 已卸载。证书目录 $CERT_DIR 与 acme.sh($ACME_HOME) 保留，如需彻底清理请手动删除。"
+    audit "UNINSTALL nginx: done"
+
+    # 卸载了 nginx，这套菜单也就没有存在意义了。此前没有任何入口能移除脚本本体与快捷
+    # 命令 n，用户只能自己去 /usr/local/bin 手动删——「装得进来、卸不干净」。
+    # 不新增菜单项，就挂在卸载流程末尾追问一句。
+    local rmself
+    read -rp "是否同时移除本脚本与快捷命令「$SHORTCUT_CMD」？(y/N): " rmself
+    case "$rmself" in
+        y|Y)
+            audit "UNINSTALL self: $INSTALL_PATH, $SHORTCUT_PATH"
+            # 删除正在执行的脚本文件是安全的：内核对已打开的 inode 保持引用，
+            # 当前进程照常读完剩余内容。为稳妥仍立刻退出，不再执行后续逻辑。
+            rm -f "$SHORTCUT_PATH" "$INSTALL_PATH" 2>/dev/null
+            rm -f "$BLOCKED_PORTS_FILE" 2>/dev/null
+            ok "已移除快捷命令 $SHORTCUT_CMD 与脚本本体 $INSTALL_PATH"
+            info "审计日志保留在 $AUDIT_LOG，备份保留在 $BACKUP_DIR，如需彻底清理请手动删除。"
+            echo
+            echo "感谢使用，再见。"
+            exit 0 ;;
+        *)  info "已保留本脚本，输入 $SHORTCUT_CMD 仍可打开菜单。" ;;
+    esac
     pause
 }
 
@@ -2016,8 +2556,9 @@ ops_menu() {
         echo "    4) 手动重启（restart，会断连，慎用）"
         echo "    5) 查看错误日志末尾（error.log）"
         echo "    6) 查看访问日志末尾（access.log）"
+        echo "    7) 查看本脚本操作记录（谁在什么时候改了什么）"
         echo "    0) 返回"
-        local op; read -rp "  请选择 [0-6]: " op
+        local op; read_choice "  请选择 [0-7]: " op
         case "$op" in
             1) systemctl status nginx --no-pager 2>/dev/null \
                  || { echo "nginx 进程："; pgrep -ax nginx || echo "（未在运行）"; } ;;
@@ -2025,8 +2566,9 @@ ops_menu() {
             3) reload_nginx ;;
             4) local yn; read -rp "  重启会中断所有连接，确认？(y/N): " yn
                case "$yn" in y|Y) restart_nginx ;; *) info "已取消" ;; esac ;;
-            5) tail -n 40 /var/log/nginx/error.log 2>/dev/null || warn "找不到 /var/log/nginx/error.log" ;;
-            6) tail -n 40 /var/log/nginx/access.log 2>/dev/null || warn "找不到 /var/log/nginx/access.log" ;;
+            5) tail -n 40 "$LOG_DIR/error.log" 2>/dev/null || warn "找不到 $LOG_DIR/error.log" ;;
+            6) tail -n 40 "$LOG_DIR/access.log" 2>/dev/null || warn "找不到 $LOG_DIR/access.log" ;;
+            7) if [ -f "$AUDIT_LOG" ]; then tail -n 40 "$AUDIT_LOG"; else warn "尚无操作记录（$AUDIT_LOG）"; fi ;;
             0) return ;;
             *) warn "无效选项"; sleep 1; continue ;;
         esac
@@ -2050,7 +2592,7 @@ manage_menu() {
         echo "  6. 运行状态 / 日志 / 手动 reload"
         echo "  0. 返回上级"
         echo "----------------------------------------"
-        local op; read -rp "请选择 [0-6]: " op
+        local op; read_choice "请选择 [0-6]: " op
         case "$op" in
             1) manage_reverse_proxy ;;
             2) cert_menu ;;
@@ -2106,7 +2648,7 @@ main_menu() {
         echo "  0. 退出"
         echo "--------------------------------------------------"
         echo "  提示：下次直接输入  $SHORTCUT_CMD  即可打开本菜单"
-        local opt; read -rp "请选择: " opt
+        local opt; read_choice "请选择: " opt
         case "$opt" in
             1) configure_reverse_proxy ;;
             2) manage_menu ;;
@@ -2120,8 +2662,20 @@ main_menu() {
     done
 }
 
-require_root
-require_apt
-ensure_tty
-setup_shortcut
-main_menu
+# 仅在「被直接执行」时进入交互；被 source 时只加载函数定义。
+# 后者是给测试用的：单测要调 valid_ipv6 / normalize_target 这类纯函数，集成测试要在
+# 沙箱路径下真实跑渲染与回滚，都不能触发 root 检查与菜单。
+# 三条分发路径下 $0 与 ${BASH_SOURCE[0]} 均相等，行为不变：
+#   bash <(curl ...)  → 两者同为 /dev/fd/N
+#   bash nginx-rp.sh  → 两者同为 nginx-rp.sh
+#   n（快捷命令）      → 两者同为 /usr/local/bin/nginx-rp.sh
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    require_root
+    acquire_lock            # 抢到锁再动任何配置，避免两个窗口并发改同一站点
+    require_apt
+    ensure_tty
+    trap cleanup_tmp EXIT INT TERM
+    restore_port_blocks     # Docker 重启会重建 DOCKER-USER 链，开机/重启后在此自愈端口封锁
+    setup_shortcut
+    main_menu
+fi

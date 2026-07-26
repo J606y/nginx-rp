@@ -1,3 +1,13 @@
+# 全仓库统一 LF。脚本用 bash <(curl ...) 直接执行，CRLF 会让 shebang 与每条命令都带
+# \r 而失败；Dockerfile 与 CI 工作流同样在 Linux 上执行，带 \r 会让 RUN 指令报错。
+* text=auto eol=lf
+
 # Shell 脚本必须用 LF，否则 Linux 上 curl|bash 会因 CR 失败
 *.sh text eol=lf
 nginx-rp.sh text eol=lf
+
+# 二进制类不做行尾转换
+*.png binary
+*.jpg binary
+*.gz  binary
+*.zip binary
