@@ -2643,6 +2643,7 @@ main_menu() {
         echo "  3. 安装 Nginx"
         echo "  4. 更新 Nginx 程序"
         echo "  5. 更新本脚本（菜单工具自身）"
+        echo "  6. 重载 Nginx 配置（reload，不断连）"
         echo "  --------------------------------------------------"
         echo "  9. 卸载 Nginx（危险）"
         echo "  0. 退出"
@@ -2655,6 +2656,15 @@ main_menu() {
             3) install_nginx ;;
             4) update_nginx ;;
             5) self_update ;;
+            6)
+                # 主菜单快捷入口：改完配置后最常用的动作，不必再钻三层菜单。
+                # 运维子菜单里的那一项保留，两处调用同一个 reload_nginx。
+                if command -v nginx >/dev/null 2>&1; then
+                    reload_nginx
+                else
+                    err "未检测到 Nginx，请先安装（主菜单 → 3）"
+                fi
+                pause ;;
             9) uninstall_nginx ;;
             0) exit 0 ;;
             *) warn "无效选项"; sleep 1 ;;

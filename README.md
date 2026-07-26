@@ -81,6 +81,7 @@ n
 3. 安装 Nginx
 4. 更新 Nginx 程序
 5. 更新本脚本（拉 GitHub 最新）
+6. 重载 Nginx 配置（reload，不断连）
 9. 卸载 Nginx（危险）
 0. 退出
 ```

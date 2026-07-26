@@ -70,13 +70,21 @@ fi
 
 # 进程替换 bash <(...)：$0 与 BASH_SOURCE[0] 同为 /dev/fd/N，必须仍进入交互入口。
 # timeout 兜底：入口守卫若写错导致卡死，测试要失败而不是把 CI 挂死。
-subst_out="$(timeout 10 bash <(cat "$SCRIPT") 2>&1 </dev/null | head -20)"
+subst_out="$(timeout 10 bash <(cat "$SCRIPT") 2>&1 </dev/null | head -40)"
 subst_rc=$?
 assert "进程替换路径未卡死" [ "$subst_rc" != 124 ]
 case "$subst_out" in
     *Nginx*|*nginx*) _ok "bash <(...) 进程替换路径仍进入主流程" ;;
     *)               _no "进程替换路径行为异常：$subst_out" ;;
 esac
+# 主菜单编号契约：老用户靠肌肉记忆按数字，新增项不得挤占既有编号
+for entry in "1. 配置反向代理" "2. 管理反向代理" "3. 安装 Nginx" "4. 更新 Nginx" \
+             "5. 更新本脚本" "6. 重载 Nginx" "9. 卸载 Nginx" "0. 退出"; do
+    case "$subst_out" in
+        *"$entry"*) _ok "主菜单保留「$entry」" ;;
+        *)          _no "主菜单缺少或改动了「$entry」" ;;
+    esac
+done
 
 # ============================================================ 渲染矩阵
 sec "渲染矩阵：5 缓存档 × 2 SSL 形态，nginx -t 全通过"
