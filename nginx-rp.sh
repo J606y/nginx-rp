@@ -977,8 +977,12 @@ purge_site_cache() {
     # 单进程串行时 CPU 大部分时间在等盘，-P 让多个 awk 同时压在 IO 队列上。
     # 每行只输出一个路径且远短于 PIPE_BUF(4096)，写入是原子的，多进程并发写同一管道
     # 不会串行交错成半行。
+    # 并发数不跟着核数走：这活的时间几乎都花在等 IO，CPU 基本闲着，
+    # 并发低于 4 时（2 核小机器、CI runner）盘的队列压不满，白等。
     local jobs; jobs=$(nproc 2>/dev/null || echo 4)
-    [ "$jobs" -gt 8 ] 2>/dev/null && jobs=8   # 再多就只是加剧盘的随机读争抢
+    case "$jobs" in ''|*[!0-9]*) jobs=4 ;; esac
+    [ "$jobs" -lt 4 ] && jobs=4
+    [ "$jobs" -gt 8 ] && jobs=8   # 再多就只是加剧盘的随机读争抢
     while IFS= read -r file; do
         [ -n "$file" ] && rm -f "$file" && n=$((n+1))
     done < <(find "$CACHE_DIR" -type f -print0 2>/dev/null \
