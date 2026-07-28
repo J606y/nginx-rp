@@ -124,8 +124,36 @@ out "http://127.0.0.1:8080"      normalize_target "127.0.0.1:8080"
 out "https://origin.example.com" normalize_target "https://origin.example.com"
 out "http://example.com"         normalize_target "example.com"
 out "http://[::1]:8080"          normalize_target "http://[::1]:8080"
-out "https://a.b.c-d.com/path/x" normalize_target "https://a.b.c-d.com/path/x"
+# 带路径前缀的目标一律补尾斜杠：模板固定 location /，nginx 会用 proxy_pass 的 URI
+# 替换命中的前缀，写成 /api 时请求 /foo 会被拼成 /apifoo（经典尾斜杠坑）。
+out "https://a.b.c-d.com/path/x/" normalize_target "https://a.b.c-d.com/path/x"
+out "https://a.b.c-d.com/path/x/" normalize_target "https://a.b.c-d.com/path/x/"
+out "http://127.0.0.1:8080/api/"  normalize_target "127.0.0.1:8080/api"
 out "http://localhost:3000/"     normalize_target "http://localhost:3000/"
+# 无路径的目标不能被加上斜杠：proxy_pass 不带 URI 时 nginx 原样透传请求路径，
+# 补成 http://host/ 反而变成「替换前缀」语义，行为会悄悄改变。
+out "http://localhost:3000"      normalize_target "http://localhost:3000"
+# 从浏览器地址栏整条粘贴：?查询 与 #锚点必须剥掉。
+# # 是 nginx 的注释符，混进 proxy_pass 会连行尾分号一起注释掉 → nginx -t 语法错误 → 神秘回滚。
+out "http://129.153.73.56:8317/management.html/" \
+    normalize_target "http://129.153.73.56:8317/management.html?safe-mode=configure#/login"
+out "http://127.0.0.1:8080"       normalize_target "http://127.0.0.1:8080?a=b"
+out "http://127.0.0.1:8080"       normalize_target "http://127.0.0.1:8080#frag"
+out "http://127.0.0.1:8080/api/"  normalize_target "http://127.0.0.1:8080/api?x=1#/login"
+# 规范化后的结果必须能原样通过再次规范化（幂等），否则管理菜单反复保存会漂移
+out "http://127.0.0.1:8080/api/"  normalize_target "$(normalize_target 'http://127.0.0.1:8080/api?x=1#/login')"
+
+# ------------------------------------------------- warn_if_target_is_page
+group target_is_page
+# 末段带扩展名 → 提醒（只提醒不阻断，返回码恒为 0）
+page_out="$(warn_if_target_is_page "http://1.2.3.4:8317/management.html/" 2>&1)"
+case "$page_out" in *具体页面*) _ok ;; *) _no "带 .html 的目标未给出提醒" ;; esac
+rc 0 warn_if_target_is_page "http://1.2.3.4:8317/management.html/"
+# 正常路径前缀 / 无路径 → 不该误报
+for t in "http://1.2.3.4:8317" "http://1.2.3.4:8317/api/" "https://origin.example.com/v1/"; do
+    quiet_out="$(warn_if_target_is_page "$t" 2>&1)"
+    [ -z "$quiet_out" ] && _ok || _no "对正常目标误报：$t → $quiet_out"
+done
 # 空值 / 协议 / 注入 / 超长端口
 for v in "" "ftp://x.com" "http://" "http://x.com;}server{listen 8888;" "http://x.com /etc" \
          'http://x.com/a;b' 'http://x.com/a{b}' 'http://x.com/a"b' "http://-bad.com" \
@@ -245,6 +273,22 @@ for fn in manage_menu ops_menu; do
     timeout 5 bash -c "source '$SCRIPT' 2>/dev/null; $fn </dev/null" >/dev/null 2>&1
     [ $? != 124 ] && _ok || _no "$fn 在 EOF 下无限循环（超时）"
 done
+
+# ------------------------------------------------- acquire_lock 不得吞掉 stderr
+group acquire_lock_stderr
+# 回归：`exec 9>"$LOCK_FILE" 2>/dev/null` 的 exec 后面没有命令，两个重定向会【一起】
+# 永久作用于当前 shell —— fd 2 从此钉死在 /dev/null。后果是整个脚本的 read -rp 提示语
+# （bash 把 -p 的提示写 stderr）、choose_cache_mode 的档位说明、apt/nginx 的报错全部
+# 静默消失，菜单表现为「只有选项、没有输入提示」。
+# 断言方式：调用 acquire_lock 时【不加任何重定向】——一旦加了，bash 会在函数返回时
+# 从副本恢复 fd 2，反而把这个 bug 盖住。
+lock_err="$(bash -c "
+LOCK_FILE='$SANDBOX/lock-stderr-regress'
+source '$SCRIPT' 2>/dev/null
+acquire_lock
+echo 'STDERR-ALIVE' >&2
+" 2>&1 >/dev/null)"
+case "$lock_err" in *STDERR-ALIVE*) _ok ;; *) _no "acquire_lock 之后 stderr 被永久重定向，所有输入提示会消失" ;; esac
 
 # ------------------------------------------------------------------- 汇总
 echo

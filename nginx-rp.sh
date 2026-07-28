@@ -112,7 +112,13 @@ audit() {
 acquire_lock() {
     command -v flock >/dev/null 2>&1 || { warn "未找到 flock，跳过单实例保护（请勿同时开两个窗口操作）。"; return 0; }
     mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null
-    exec 9>"$LOCK_FILE" 2>/dev/null || { warn "无法创建锁文件 $LOCK_FILE，跳过单实例保护。"; return 0; }
+    # 重定向必须用 { } 包住：`exec 9>f 2>/dev/null` 里 exec 后面没有命令，两个重定向
+    # 会【一起】永久作用于当前 shell——stderr 从此指向 /dev/null，整个脚本后续所有
+    # read -rp 的提示语、choose_cache_mode 的档位说明、apt/nginx 的报错全部消失。
+    # 加 { } 后 2>/dev/null 只临时套在这一条上，退出复合命令即还原；fd 9 由 exec 持久保留。
+    if ! { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
+        warn "无法创建锁文件 $LOCK_FILE，跳过单实例保护。"; return 0
+    fi
     if ! flock -n 9; then
         err "已有另一个 nginx-rp 实例正在运行（锁：$LOCK_FILE）。"
         err "同时操作会造成配置竞态，请等它退出后再试。"
@@ -274,12 +280,37 @@ reload_nginx() {
     return 1
 }
 
+# 清本机 DNS 缓存。
+# 背景：upstream 里写域名时（https://回源域名 这类回源），nginx 只在「配置加载的那一刻」
+# 解析一次主机名，结果在该份配置的整个生命周期内固定不变。源站换 IP 后，就算重启了
+# nginx，只要本机 resolver 还缓着旧 A 记录，新 master 仍会解析到旧 IP——表现就是
+# 「重载了也没用，还是连老 IP」。所以重启前先把本机缓存清掉，确保拿到权威新记录。
+# 没有这些组件的系统直接跳过：清缓存是加固手段，不该成为重启的前置条件。
+flush_dns_cache() {
+    if command -v resolvectl >/dev/null 2>&1; then
+        resolvectl flush-caches >/dev/null 2>&1 && return 0
+    fi
+    if command -v systemd-resolve >/dev/null 2>&1; then
+        systemd-resolve --flush-caches >/dev/null 2>&1 && return 0
+    fi
+    if systemctl is-active --quiet nscd 2>/dev/null; then
+        systemctl restart nscd >/dev/null 2>&1 && return 0
+    fi
+    if command -v nscd >/dev/null 2>&1; then
+        nscd -i hosts >/dev/null 2>&1 && return 0
+    fi
+    return 0
+}
+
 # 完整重启 nginx（升级二进制后必须用）：reload/HUP 只重读配置、不换二进制，且旧 master 的
 # worker 可能赖着不退继续用旧配置服务。systemctl restart 会把整个服务进程组换新，连僵尸
 # worker 一起清掉。非 systemd 环境回退到 stop + 清残留 + start。
+# 重启同时是「回源域名换了 IP」的唯一可靠收敛手段：先清本机 DNS 缓存，再让新 master
+# 重新解析所有 upstream 主机名，旧 worker 连同它到旧 IP 的 keepalive 连接一起消失。
 restart_nginx() {
     neutralize_conf_gzip   # 同 reload：重启前兜底清掉 nginx.conf 默认 gzip，避免重复声明
     nginx_test || { err "未重启。"; return 1; }
+    flush_dns_cache        # 必须在起新 master 之前：晚一步新 master 就已经拿旧记录解析完了
     if systemctl restart nginx 2>/dev/null; then
         ok "Nginx 已重启（systemd）"; return 0
     fi
@@ -1646,8 +1677,18 @@ normalize_target() {
         '')    return 1 ;;
         *)     t="http://$t" ;;     # 漏写 scheme：默认补 http://
     esac
-    local rest hostpart pathpart
+    local scheme rest hostpart pathpart
+    scheme="${t%%://*}"
     rest="${t#*://}"
+    # 从浏览器地址栏整条粘过来是最常见的填法，先剥掉服务端根本用不到的两段：
+    #   #fragment —— 浏览器压根不会把它发给服务器，nginx 永远看不到；更要命的是 #
+    #                在 nginx 配置里是注释符，写进 proxy_pass 会把行尾的分号一并注释掉，
+    #                nginx -t 直接语法错误，用户只看到一次莫名其妙的回滚。
+    #   ?query    —— proxy_pass 的 URI 带查询串会和请求自身的参数打架，本模板固定
+    #                location /，没有任何正确用法。
+    rest="${rest%%#*}"
+    rest="${rest%%\?*}"
+    t="$scheme://$rest"
     hostpart="${rest%%/*}"
     case "$rest" in */*) pathpart="/${rest#*/}";; *) pathpart="";; esac
     [ -z "$hostpart" ] && return 1  # 形如 http:// 没有主机部分
@@ -1662,7 +1703,37 @@ normalize_target() {
     case "$pathpart" in
         *';'*|*'{'*|*'}'*|*'"'*|*"'"*|*'\'*|*' '*|*$'\t'*|*$'\n'*|*$'\r'*) return 1 ;;
     esac
+
+    # 带路径前缀的目标必须以 / 结尾。
+    # 站点模板固定用 location /，而 nginx 会把「命中 location 的那段前缀」替换成
+    # proxy_pass 里的 URI：proxy_pass http://up/api; 时请求 /foo 会被拼成 /apifoo，
+    # 而不是任何人期望的 /api/foo。写成 /api/ 才得到 /api/foo。
+    # 这个尾斜杠是 nginx 最经典的坑，且缺了它的写法没有任何合理用途——直接补齐，
+    # 并由调用方的「已自动补全为」提示告诉用户改成了什么。
+    case "$pathpart" in
+        ''|*/) ;;
+        *) t="$t/" ;;
+    esac
     printf '%s' "$t"
+}
+
+# 目标路径末段带扩展名（/management.html 这类）时提醒一句。
+# 那多半是从浏览器地址栏粘过来的「某个具体页面」，而不是想挂载的路径前缀：模板固定
+# location /，填成具体页面会把整站请求全改写到该页面下，静态资源与接口一律 404。
+# 只提醒、不阻断——万一真有人要挂到 /x.php/ 下，不该被拦住。
+warn_if_target_is_page() {
+    local t="$1" rest hostport path last
+    rest="${t#*://}"
+    hostport="${rest%%/*}"
+    case "$rest" in */*) path="/${rest#*/}" ;; *) return 0 ;; esac
+    last="${path%/}"; last="${last##*/}"
+    case "$last" in
+        *.*) ;;          # 末段带扩展名 → 像具体页面
+        *)   return 0 ;;
+    esac
+    warn "目标路径「$path」末段像一个具体页面，不是路径前缀。"
+    warn "只想反代整站的话，目标填到端口为止即可：${t%%://*}://$hostport"
+    return 0
 }
 
 # 校验单个域名格式（不含通配符；泛域名仅在 DNS 证书签发时自动追加）。
@@ -1876,12 +1947,14 @@ configure_reverse_proxy() {
     for _d in $domain; do
         valid_domain "$_d" || { err "域名格式不对：$_d"; pause; return; }
     done
-    read -rp "请输入反代目标（如 http://127.0.0.1:8080，也支持 https://源站域名 回源）: " target
+    echo "反代目标：http://127.0.0.1:8080 ｜ https://源站域名（回源）｜ 可带路径前缀 http://127.0.0.1:8080/api"
+    read -rp "请输入反代目标: " target
     [ -z "$target" ] && { err "目标不能为空"; pause; return; }
     local nt; nt="$(normalize_target "$target")" \
         || { err "目标格式不对，应形如 http://127.0.0.1:8080 或 https://源站域名"; pause; return; }
-    [ "$nt" != "$target" ] && info "已自动补全反代目标为：$nt"
+    [ "$nt" != "$target" ] && info "反代目标已规范化为：$nt（会剥掉 ?查询 与 #锚点，路径前缀补尾斜杠）"
     target="$nt"
+    warn_if_target_is_page "$target"
     read -rp "客户端最大请求体大小 MB（上传用，默认 1024）: " maxbody
     [ -z "$maxbody" ] && maxbody=1024
     case "$maxbody" in *[!0-9]*) warn "大小需为数字，已改用默认 1024"; maxbody=1024 ;; esac
@@ -2091,8 +2164,9 @@ manage_managed_site() {
                 [ -z "$target" ] && { err "不能为空"; pause; continue; }
                 local nt; nt="$(normalize_target "$target")" \
                     || { err "目标格式不对，应形如 http://127.0.0.1:8080 或 https://源站域名"; pause; continue; }
-                [ "$nt" != "$target" ] && info "已自动补全为：$nt"
+                [ "$nt" != "$target" ] && info "反代目标已规范化为：$nt（会剥掉 ?查询 与 #锚点，路径前缀补尾斜杠）"
                 target="$nt"
+                warn_if_target_is_page "$target"
                 ask_ssl_verify "$target"   # 目标变了,https 回源证书校验重新问(http 目标自动置空)
                 SITE[target]="$target"; SITE[sslverify]="$SSL_VERIFY"
                 render_site_safe && ok "目标已更新"
@@ -2556,8 +2630,8 @@ ops_menu() {
         c_green "===== 运行状态 / 日志 / 维护 ====="
         echo "    1) Nginx 运行状态"
         echo "    2) 测试配置（nginx -t）"
-        echo "    3) 手动重载（reload，优雅，不断连）"
-        echo "    4) 手动重启（restart，会断连，慎用）"
+        echo "    3) 平滑重载（reload，不断连；旧连接最多 30s 才切到新配置）"
+        echo "    4) 强制生效（restart，断开所有连接，回源域名重新解析 IP）"
         echo "    5) 查看错误日志末尾（error.log）"
         echo "    6) 查看访问日志末尾（access.log）"
         echo "    7) 查看本脚本操作记录（谁在什么时候改了什么）"
@@ -2647,7 +2721,7 @@ main_menu() {
         echo "  3. 安装 Nginx"
         echo "  4. 更新 Nginx 程序"
         echo "  5. 更新本脚本（菜单工具自身）"
-        echo "  6. 重载 Nginx 配置（reload，不断连）"
+        echo "  6. 应用配置并强制生效（断开所有连接，回源域名重新解析 IP）"
         echo "  --------------------------------------------------"
         echo "  9. 卸载 Nginx（危险）"
         echo "  0. 退出"
@@ -2661,10 +2735,14 @@ main_menu() {
             4) update_nginx ;;
             5) self_update ;;
             6)
-                # 主菜单快捷入口：改完配置后最常用的动作，不必再钻三层菜单。
-                # 运维子菜单里的那一项保留，两处调用同一个 reload_nginx。
+                # 主菜单快捷入口用的是 restart 而非 reload，这是刻意的：
+                # reload 只让【新】worker 用新配置，旧 worker 会带着到旧 IP 的 keepalive
+                # 连接继续服务到自己退出为止（上限 worker_shutdown_timeout 30s）；而
+                # upstream 里的域名只在配置加载那一刻解析一次，源站换 IP 后 reload 常常
+                # 「看着成功、实际还连老 IP」。要「这一刻全部断开、按新 IP 重连」只有 restart。
+                # 需要不断连的平滑重载时走：管理反向代理 → 运维 → 3。
                 if command -v nginx >/dev/null 2>&1; then
-                    reload_nginx
+                    restart_nginx
                 else
                     err "未检测到 Nginx，请先安装（主菜单 → 3）"
                 fi
