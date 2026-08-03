@@ -33,6 +33,10 @@ SITES_ENABLED="${SITES_ENABLED:-/etc/nginx/sites-enabled}"
 NGINX_CONF_D="${NGINX_CONF_D:-/etc/nginx/conf.d}"           # 发现/管理外部反代时用
 NGINX_CONF="${NGINX_CONF:-/etc/nginx/nginx.conf}"           # 主配置（本脚本会修改，改前备份）
 GLOBAL_CONF="${GLOBAL_CONF:-$NGINX_CONF_D/00-nginx-rp.conf}"
+# 公共配置的内容版本，写进文件头的 "# conf-version:"。存量机器靠它判断自己那份是否过期：
+# 脚本自更新后版本对不上就重写一遍。往公共配置里增删内容时【必须】把它加一，否则老机器
+# 会一直用着旧的公共配置，而新渲染的站点配置已经依赖新内容 → nginx -t 失败且原因隐蔽。
+GLOBAL_CONF_VERSION=2
 DENY_IP_CONF="${DENY_IP_CONF:-$NGINX_CONF_D/00-deny-direct-ip.conf}"   # 禁止用 IP 直连的兜底 server
 REALIP_CONF="${REALIP_CONF:-$NGINX_CONF_D/00-nginx-rp-realip.conf}"    # 信任上游代理、从 XFF 还原真实客户端 IP
 CERT_DIR="${CERT_DIR:-/etc/nginx/certs}"
@@ -896,6 +900,49 @@ neutralize_conf_gzip() {
     return 0
 }
 
+# 抬高 nginx 的两个哈希桶上限。这是一条「域名多一个字符就炸」的隐性阈值，必须主动兜住：
+# nginx 建哈希表时每个条目占 8 + align(名字长度 + 2, 8) + 8 字节，默认桶 64 字节只放得下
+# 46 字符的名字，超一个字符就 emerg「could not build ...hash」，整份配置起不来。
+#   · variables_hash：本脚本给每站生成的白名单/会话判定变量是 rp_<域名去符号>_<cksum>_deny，
+#     长度 = 14 + 域名长度 + 5 —— 域名满 28 字符即溢出（实锤 origin-openclaw.20051212.xyz
+#     恰好 28 字符，一开 IP 白名单 nginx -t 必挂）。
+#   · server_names_hash：域名本身满 47 字符即溢出。
+# 统一抬到 128（容得下 110 字符的名字 ≈ 96 字符的域名），代价只是每桶几十字节内存。
+#
+# 两条指令都属 http 上下文且【不可重复声明】（重复即 "directive is duplicate"），所以先看主配置：
+#   没设     → 由公共配置给 128
+#   设了但小 → 注释掉主配置那行，改由公共配置统一给（否则两处声明直接把 nginx -t 打挂）
+#   设得更大 → 是用户的有意为之，本脚本不声明、不覆盖
+# 备份或改写失败时宁可不动主配置，也不留下一份两处声明的坏配置。
+ensure_hash_bucket_sizes() {
+    local want=128 d cur
+    local -a emit=()
+    for d in variables_hash_bucket_size server_names_hash_bucket_size; do
+        cur="$(grep -oE "^[[:space:]]*${d}[[:space:]]+[0-9]+[[:space:]]*;" "$NGINX_CONF" 2>/dev/null \
+               | head -n1 | grep -oE '[0-9]+')"
+        if [ -n "$cur" ]; then
+            if [ "$cur" -ge "$want" ]; then
+                info "nginx.conf 已设 $d $cur（不小于 $want），沿用该值。"
+                continue
+            fi
+            backup_nginx_conf || { warn "无法备份 nginx.conf，跳过 $d 调整（长域名站点可能 nginx -t 失败）。"; continue; }
+            if ! sed -i -E "s|^([[:space:]]*)(${d}[[:space:]]+[0-9]+[[:space:]]*;)|\1# \2  # 由 nginx-rp.sh 注释：改由 ${GLOBAL_CONF##*/} 统一设为 ${want}|" "$NGINX_CONF" 2>/dev/null; then
+                warn "未能改写 nginx.conf 内的 $d，跳过（长域名站点可能 nginx -t 失败）。"
+                continue
+            fi
+            warn "已注释 nginx.conf 内的 $d $cur（改由公共配置统一设为 $want，容纳长域名）"
+            audit "MODIFY nginx.conf: comment out $d=$cur (superseded by $want)"
+        fi
+        emit+=("$d")
+    done
+    [ ${#emit[@]} -eq 0 ] && return 0
+    {
+        printf '\n# 哈希桶上限：默认 64 字节只容得下 46 字符的名字，长域名会让本脚本生成的\n'
+        printf '# geo/map 变量名（rp_<域名>_<cksum>_deny）或域名本身撞桶，nginx -t 直接 emerg。\n'
+        for d in "${emit[@]}"; do printf '%s %s;\n' "$d" "$want"; done
+    } >> "$GLOBAL_CONF"
+}
+
 # ----------------------------- 全局配置 -------------------------------------
 # 写入 http 上下文的公共配置：缓存区、websocket upgrade map、媒体类型跳过缓存 map
 ensure_global_conf() {
@@ -904,8 +951,11 @@ ensure_global_conf() {
     rm -f /etc/nginx/conf.d/00-1keji-rp.conf 2>/dev/null
     mkdir -p "$ACME_WEBROOT" "$CACHE_DIR" "$CERT_DIR"
     id www-data >/dev/null 2>&1 && chown -R www-data:www-data "$CACHE_DIR" 2>/dev/null
-    cat > "$GLOBAL_CONF" <<'EOF'
+    cat > "$GLOBAL_CONF" <<EOF
 # 由 nginx-rp.sh 管理，请勿手动编辑。
+# conf-version: $GLOBAL_CONF_VERSION
+EOF
+    cat >> "$GLOBAL_CONF" <<'EOF'
 # 反代缓存区（普通缓存 / 视频分片缓存共用）
 proxy_cache_path /var/cache/nginx/nginx_rp levels=1:2 keys_zone=rpcache:100m max_size=10g inactive=7d use_temp_path=off;
 
@@ -961,6 +1011,7 @@ map $uri $rp_not_static {
 # gzip 的老客户端由本机解压兜底（Debian/Ubuntu 官方 nginx 均带 gunzip 模块）。
 gunzip on;
 EOF
+    ensure_hash_bucket_sizes   # 长域名撞哈希桶的兜底（必须在写完公共配置后追加）
     ensure_worker_shutdown_timeout
     neutralize_conf_gzip   # 消除 nginx.conf 默认 gzip 与本文件的重复声明
     ok "公共配置已写入 $GLOBAL_CONF"
@@ -1644,8 +1695,11 @@ render_site_safe() {
     if [ -L "$link" ] || [ -e "$link" ]; then had_link=1; fi
 
     # 全局配置守卫：缓存块引用 $rp_has_session/$rp_not_static 等全局 map。脚本自更新后，
-    # 老机器的全局配置可能还没有这些定义 → 渲染必定 nginx -t 失败。缺了就补写（幂等）。
-    grep -q 'rp_not_static' "$GLOBAL_CONF" 2>/dev/null || ensure_global_conf
+    # 老机器的全局配置可能还没有这些定义 → 渲染必定 nginx -t 失败。过期就重写（幂等）。
+    # 判据用版本号而不是「grep 某个 map 名」：新增的哈希桶指令在用户已自设更大值时【本就
+    # 不该出现】，用内容做判据会把这种正常情况误判成缺失，每次渲染都重写一遍全局配置。
+    # 往公共配置里加内容时，把 GLOBAL_CONF_VERSION 加一即可让存量机器在下次渲染时收敛。
+    grep -q "^# conf-version: $GLOBAL_CONF_VERSION\$" "$GLOBAL_CONF" 2>/dev/null || ensure_global_conf
 
     if ! render_site_file; then
         err "站点配置渲染失败，已回滚到修改前状态。"

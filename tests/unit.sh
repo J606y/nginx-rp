@@ -30,6 +30,7 @@ export AUDIT_LOG="$SANDBOX/audit.log"
 export LOCK_FILE="$SANDBOX/lock"
 export BLOCKED_PORTS_FILE="$SANDBOX/blocked-ports"
 export ACME_HOME="$SANDBOX/acme"
+export ACME_WEBROOT="$SANDBOX/acme-webroot"
 mkdir -p "$SITES_AVAIL" "$SITES_ENABLED" "$NGINX_CONF_D" "$LOG_DIR"
 
 # shellcheck source=../nginx-rp.sh
@@ -242,6 +243,68 @@ eq "$(grep -c '# gzip_vary on;' "$SANDBOX/ngx.out")" "1" "已注释行被二次�
 awk "$_GZIP_AWK" "$SANDBOX/ngx.out" > "$SANDBOX/ngx.out2"; awk_rc2=$?
 eq "$awk_rc2" "1" "无 http 顶层 gzip 时 awk 应返回 1"
 if diff -q "$SANDBOX/ngx.out" "$SANDBOX/ngx.out2" >/dev/null; then _ok; else _no "gzip 处理非幂等"; fi
+
+# --------------------------------------------------- ensure_hash_bucket_sizes
+group hash_bucket
+# 背景：nginx 哈希桶默认 64 字节只容得下 46 字符的名字，本脚本生成的 geo 变量
+# rp_<域名>_<cksum>_deny 长度 = 14 + 域名长度 + 5，域名满 28 字符即 emerg。
+# 这两条指令属 http 上下文且不可重复声明，三条分支各测一遍。
+HB_CONF="$NGINX_CONF_D/00-nginx-rp.conf"
+
+# ① 主配置未声明 → 公共配置补两条，主配置一个字节都不该被动
+cat > "$NGINX_CONF" <<'EOF'
+events { worker_connections 768; }
+http { include /etc/nginx/conf.d/*.conf; }
+EOF
+: > "$HB_CONF"
+hb_before="$(cat "$NGINX_CONF")"
+ensure_hash_bucket_sizes >/dev/null 2>&1
+eq "$(grep -c '^variables_hash_bucket_size 128;'    "$HB_CONF")" "1" "未声明时应补 variables_hash_bucket_size"
+eq "$(grep -c '^server_names_hash_bucket_size 128;' "$HB_CONF")" "1" "未声明时应补 server_names_hash_bucket_size"
+eq "$(cat "$NGINX_CONF")" "$hb_before" "主配置无相关声明时不得被改写"
+
+# ② 主配置设了更小的值 → 注释掉它，改由公共配置统一给（两处并存必报 is duplicate）
+cat > "$NGINX_CONF" <<'EOF'
+http {
+    variables_hash_bucket_size 64;
+}
+EOF
+: > "$HB_CONF"; NGINX_CONF_BACKED_UP=0
+ensure_hash_bucket_sizes >/dev/null 2>&1
+grep -qE '^[[:space:]]*# variables_hash_bucket_size 64;' "$NGINX_CONF" && _ok || _no "主配置里过小的值未被注释"
+eq "$(grep -c '^variables_hash_bucket_size 128;' "$HB_CONF")" "1" "注释旧值后仍应由公共配置给 128"
+# 幂等：再跑一次不得把已注释的行二次注释
+ensure_hash_bucket_sizes >/dev/null 2>&1
+eq "$(grep -c '# variables_hash_bucket_size 64;' "$NGINX_CONF")" "1" "已注释行被二次注释"
+
+# ③ 用户自己设了更大的值 → 尊重用户，且公共配置绝不能再声明一遍
+cat > "$NGINX_CONF" <<'EOF'
+http {
+    server_names_hash_bucket_size 256;
+}
+EOF
+: > "$HB_CONF"; NGINX_CONF_BACKED_UP=0
+ensure_hash_bucket_sizes >/dev/null 2>&1
+grep -qE '^[[:space:]]*server_names_hash_bucket_size 256;' "$NGINX_CONF" && _ok || _no "用户设的更大的值被改写"
+eq "$(grep -c 'server_names_hash_bucket_size' "$HB_CONF")" "0" "重复声明会让 nginx -t 报 directive is duplicate"
+
+# ------------------------------------------------------ 公共配置版本戳
+group global_conf_version
+# 存量机器靠文件头的版本戳判断自己那份公共配置是否过期（render_site_safe 里那句 grep）。
+# 写入方与判读方的格式一旦对不上，老机器就永远收不到新内容，而新站点配置已经依赖它
+# —— 表现是「更新了脚本却还是 nginx -t 失败」。这里用真实产物钉死双方的一致性。
+cat > "$NGINX_CONF" <<'EOF'
+events { worker_connections 768; }
+http { include /etc/nginx/conf.d/*.conf; }
+EOF
+NGINX_CONF_BACKED_UP=0
+ensure_global_conf >/dev/null 2>&1
+grep -q "^# conf-version: $GLOBAL_CONF_VERSION\$" "$NGINX_CONF_D/00-nginx-rp.conf" \
+    && _ok || _no "公共配置的版本戳与 render_site_safe 的判读格式不一致"
+grep -q '^variables_hash_bucket_size 128;' "$NGINX_CONF_D/00-nginx-rp.conf" \
+    && _ok || _no "ensure_global_conf 未落下哈希桶指令"
+grep -q 'rp_not_static' "$NGINX_CONF_D/00-nginx-rp.conf" \
+    && _ok || _no "追加写法把原有 map 内容弄丢了"
 
 # ------------------------------------------------------------------- audit
 group audit

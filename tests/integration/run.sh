@@ -133,6 +133,29 @@ else
     _ok "未使用 allow/deny（改用 geo）"
 fi
 
+sec "长域名白名单：geo 变量名撞哈希桶的回归"
+# 实锤：origin-openclaw.20051212.xyz（28 字符）一开白名单，nginx -t 直接
+# emerg「could not build variables_hash, you should increase
+# variables_hash_bucket_size: 64」。根因是 geo 变量名 rp_<域名去符号>_<cksum>_deny
+# 恰好 47 字符，而默认 64 字节的桶只容得下 46 字符——域名少一个字符都不触发，
+# 所以上面 coexist.example.com（19 字符）这类短域名用例永远测不出来。
+site_reset
+SITE[domain]="origin-longname.20051212.example.com"   # 36 字符，稳过 46 字符阈值
+SITE[target]="http://127.0.0.1:8080"
+SITE[allow_ips]="203.0.113.10"
+render_site_file >/dev/null 2>&1 && nginx -t >/dev/null 2>&1
+long_rc=$?
+assert "长域名 + 白名单渲染并通过 nginx -t" [ "$long_rc" = 0 ]
+LONG=/etc/nginx/sites-available/origin-longname.20051212.example.com.conf
+# 防退化：这条用例的全部价值在于变量名确实越过了默认桶的容量。若将来命名规则变短，
+# 用例会变成一句空断言——这里把前提本身钉死。
+LONGVAR="$(grep -oE 'rp_[A-Za-z0-9_]+_deny' "$LONG" 2>/dev/null | head -n1)"
+assert "geo 变量名确实超出默认 64 字节桶的上限（${#LONGVAR} ≥ 47）" [ "${#LONGVAR}" -ge 47 ]
+assert "公共配置已抬高 variables_hash_bucket_size" \
+    grep -q '^variables_hash_bucket_size 128;' /etc/nginx/conf.d/00-nginx-rp.conf
+rm -f "$LONG" /etc/nginx/sites-enabled/origin-longname.20051212.example.com.conf
+assert "长域名用例清理干净，nginx -t 回到基线" nginx -t
+
 sec "micro 自定义 TTL 与登录 cookie"
 site_reset
 SITE[domain]="micro2.example.com"; SITE[target]="http://127.0.0.1:8080"
